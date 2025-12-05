@@ -3,12 +3,7 @@ from langgraph.graph import START, END, StateGraph
 from langgraph.types import Command, Send
 from langchain_core.runnables import RunnableConfig
 from langchain_core.messages import (
-    AIMessage,
     HumanMessage,
-    SystemMessage,
-    ToolMessage,
-    filter_messages,
-    get_buffer_string,
 )
 
 from state import (
@@ -29,7 +24,9 @@ from state import (
     StatusBlock,
     WordMemoryResult,
     ImageGenOutput,
-    TTSGenOutput
+    TTSGenOutput,
+    FinalReplyOutput,
+    AgentInputState
     )
 from utils import (
     get_api_key_for_model,
@@ -37,13 +34,7 @@ from utils import (
     tts_generation_tool
 )
 from configuration import (
-    EnglishAppConfig,
-    LLMConfig,
-    FeatureFlags,
-    PreferenceConfig,
-    DefaultStyleConfig,
-    SafetyConfig,
-    RetryConfig
+    EnglishAppConfig
     )
 
 from prompt import(
@@ -54,8 +45,11 @@ from prompt import(
     final_result_prompt
     )
 
+from langgraph.checkpoint.memory import InMemorySaver
+
 from typing import Literal
 import json
+from datetime import datetime
 
 
 
@@ -538,6 +532,167 @@ async def generate_tts(state: AgentState,
 
 
 async def final_result(state: AgentState,
-                       config: RunnableConfig) -> WordMemoryResult:
+                       config: RunnableConfig):
     """最终结果智能体逻辑：
+    """
+    # Load configuration
+    configurable = EnglishAppConfig.from_runnable_config(config)
+    model_config = {
+        "model": configurable.llm.main_agent_model,
+        "temperature": configurable.llm.main_agent_temperature,
+        "api_key": get_api_key_for_model(configurable.llm.main_agent_model, config)
+    }
+
+    decision = state.get("decision")
+
+    # 获取基础元数据
+    intent = decision.intent if decision else "unknown"
+    target_word = decision.word if decision and decision.word else state.get("word") or "unknown"
+    current_style_id = state['style_profile_id'] or configurable.defaults.default_style_profile_id
+
+    # 准备最终输出的 Prompt
+    formatted_prompt = final_result_prompt.replace("{intent}", intent)\
+                                          .replace("{word}", target_word)\
+                                          .replace("{style_profile_id}", current_style_id)
+    model = (
+        configurable_model
+        .with_structured_output(FinalReplyOutput)
+        .with_retry(stop_after_attempt=configurable.retry.max_retries)
+        .with_config(model_config)
+    )
+
+    response = await model.ainvoke([HumanMessage(content=formatted_prompt)])
+    final_reply_text = response.reply_text
+
+    # 异常处理 (Out of Scope)
+    if intent == "out_of_scope":
+         # 如果超纲，只返回 reply_text，不构造 WordMemoryResult (或者构造一个空的)
+        return Command(
+            update={
+                "reply_text": final_reply_text,
+                "final_output": None # 标记为无数据
+            },
+            goto=END
+        )
+    
+    # 构造最终的 WordMemoryResult
+    # --- A. 组装 WordBlock ---
+    partial = state.get("word_block_partial")
+
+    if partial and isinstance(partial, dict):
+        word_block_obj = WordBlock(**partial)
+    else:
+        # 降级策略：如果 mnemonic 没运行(如只改图)，从 state 扁平字段拼凑
+        # 这种情况下音标(ipa)可能会缺失，需给默认值
+        word_block_obj = WordBlock(
+            word=target_word,
+            phonetic=Phonetic(ipa="", pronunciation_note=""),
+            homophone=Homophone(
+                text=state.get("mnemonic") or "生成中...",
+                raw="",
+                explanation=""
+            ),
+            story=state.get("scene_text") or "暂无故事",
+            meaning=Meaning(
+                pos="unknown",
+                cn=state.get("meaning") or "暂无释义"
+            )
+        )
+    
+    # --- B. 组装 MediaBlock ---
+    # 检查 Image
+    img_obj = None
+    if state.get("image_url"):
+        # 尝试获取风格
+        s_style = "comic" # 默认
+        s_mood = "funny"
+        if decision and decision.image_style:
+            s_style = decision.image_style.style
+            s_mood = decision.image_style.mood
+
+        img_obj = ImageMedia(
+            url=state.get("image_url"),
+            style=s_style if s_style != "none" else "comic",
+            mood=s_mood,
+            updated_at=datetime.now().isoformat()
+        )
+    
+    # 检查 Audio
+    audio_obj = None
+    if state.get("audio_url"):
+        v_preset = None
+        if decision and decision.voice_style:
+            v_preset = decision.voice_style.preset_id
+            
+        audio_obj = AudioMedia(
+            url=state.get("audio_url"),
+            voice_profile_id=v_preset,
+            duration_sec=0.0, # 需后端计算，此处占位
+            updated_at=datetime.now().isoformat()
+        )
+    
+    media_block_obj = MediaBlock(image=img_obj, audio=audio_obj)
+
+    # --- C. 组装 StylesBlock ---
+    styles_block_obj = StylesBlock(
+        style_profile_id=current_style_id,
+        mnemonic_style=decision.mnemonic_style if decision else None,
+        image_style=decision.image_style if decision else None,
+        voice_style=decision.voice_style if decision else None
+    )
+
+    # --- D. 组装 StatusBlock ---
+    updated_parts_list = []
+    reason_str = "Generated."
+    scope_str = "this_turn"
+
+    if decision:
+        if decision.need_new_mnemonic: updated_parts_list.append("mnemonic")
+        if decision.need_new_image: updated_parts_list.append("image")
+        if decision.need_new_audio: updated_parts_list.append("audio")
+        reason_str = decision.reason
+        scope_str = decision.scope
+
+    status_block_obj = StatusBlock(
+        is_first_time=False, # 这里暂定False，实际业务需判断DB
+        intent=intent,
+        updated_parts=updated_parts_list,
+        scope=scope_str,
+        reason=reason_str
+    )
+
+    # 最终构建 WordMemoryResult
+    final_result_obj = WordMemoryResult(
+        type="word_memory",
+        intent=intent,
+        word_block=word_block_obj,
+        media=media_block_obj,
+        styles=styles_block_obj,
+        status=status_block_obj
+    )
+
+    # 将 Pydantic 对象转为 Dict 存入 State (方便 JSON 序列化传给前端)
+    return Command(
+        update={
+            "reply_text": final_reply_text,
+            "final_output": final_result_obj.model_dump()
+        },
+        goto=END
+    )
+
+
+english_app_agent_graph = StateGraph(AgentState, input=AgentInputState)
+english_app_agent_graph.add_node("main_agent_logic", main_agent_logic)
+english_app_agent_graph.add_node("generate_mnemonic", generate_mnemonic)
+english_app_agent_graph.add_node("generate_image", generate_image)
+english_app_agent_graph.add_node("generate_tts", generate_tts)
+english_app_agent_graph.add_node("final_result", final_result)
+
+english_app_agent_graph.add_edge(START, "main_agent_logic")
+english_app_agent_graph.add_edge("final_result", END)
+
+config = {"configurable": {"thread_id": 1}}
+store = InMemorySaver()
+
+app_agent = english_app_agent_graph.compile(store=store, config=config)
 

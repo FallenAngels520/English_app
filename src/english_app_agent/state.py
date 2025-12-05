@@ -328,6 +328,11 @@ class WordMemoryResult(BaseModel):
     )
 
 # state
+class AgentInputState(MessagesState):
+    """InputState is only 'messages'.
+    用户输入，通常是保存在messages；是作为整个图的开始；
+    """
+
 class AgentState(MessagesState):
     """English App Agent State."""
 
@@ -353,6 +358,8 @@ class AgentState(MessagesState):
     last_decision: Optional[dict]
 
     reply_text: Optional[str]        # 给前端的文案（在 reply 节点设置）
+
+    final_output: Optional[str]     # 最终输出结果（包含所有生成内容）
 
 # 图片生成agent的输出结构
 class ImageGenOutput(BaseModel):
@@ -390,3 +397,6 @@ class TTSGenOutput(BaseModel):
         description="参数选择理由"
     )
 
+# 最终的输出格式
+class FinalReplyOutput(BaseModel):
+    reply_text: str
