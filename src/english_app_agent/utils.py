@@ -22,7 +22,7 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
             return os.getenv("OPENAI_API_KEY")
         elif model_name.startswith("anthropic:"):
             return os.getenv("ANTHROPIC_API_KEY")
-        elif model_name.startswith("google"):
+        elif model_name.startswith("deepseek:"):
             return os.getenv("DEEPSEEK_API_KEY")
         return None
     
@@ -34,3 +34,11 @@ async def generate_image_tool(prompt: str, config_style: dict):
 async def tts_generation_tool(text: str, voice_profile_id: str, speed: float):
     # todo: implement tts generation logic here
     pass
+
+
+def to_dict_or_self(x):
+    if x is None:
+        return None
+    if hasattr(x, "model_dump"):
+        return x.model_dump()
+    return x

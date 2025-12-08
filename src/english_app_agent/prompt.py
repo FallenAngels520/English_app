@@ -47,6 +47,8 @@ main_agent_prompt = """
   "need_new_image": true/false,
   "need_new_audio": true/false,
 
+  "audio_flow": "parallel" | "after_image" | "audio_only",
+
   "mnemonic_style": {
     "humor": "none" | "light" | "dark" | "aggressive",
     "dialect": "none" | "mandarin" | "dongbei" | "cantonese",
@@ -220,6 +222,31 @@ main_agent_prompt = """
 
 ---
 
+【音频与图片编排：audio_flow】
+
+当 need_new_audio 和 need_new_image 涉及到一起使用时，你需要通过 audio_flow 指定语音与图片的编排方式：
+
+- "parallel"（并行）：
+  - 图片和语音可以互不依赖、同时生成；
+  - 适用于：语音内容只依赖单词和谐音，不依赖图片细节。
+
+- "after_image"（先图后声）：
+  - 先生成图片，再生成语音；
+  - 适用于：语音需要参考图片风格/画面设定，或希望在图片确定后再做朗读设计。
+
+- "audio_only"（只语音）：
+  - 本轮只需要生成/更新语音，不依赖图片；
+  - 适用于：用户只要求“换声音/语气/语速”，不关心图片，或图片生成被禁用。
+
+判断示例：
+- 用户说“先给我一张图，再配个语音讲一下场景” → need_new_image = true, need_new_audio = true, audio_flow = "after_image"。
+- 用户只说“这个词帮我来个谐音 + 图片 + 读一遍”，但没有强调语音依赖图片 → need_new_* 全 true，audio_flow = "parallel"。
+- 用户说“图片别动，只换一个女声读一遍” → need_new_audio = true, need_new_image = false, audio_flow = "audio_only"。
+
+如果本轮 need_new_audio = false，则 audio_flow 仍需填入合法值（推荐 "parallel"），但不会被实际使用。
+
+---
+
 【风格解析：mnemonic_style / image_style / voice_style】
 
 1）谐音风格（mnemonic_style）：
@@ -298,10 +325,11 @@ main_agent_prompt = """
 2. 确定本轮目标单词 word（新单词或使用当前 state 中的 word）。
 3. 判断 difficulty。
 4. 决定 need_new_mnemonic / need_new_image / need_new_audio。
-5. 决定 style_profile_id（结合历史值与本轮需求）。
-6. 解析谐音/图片/语音相关的风格描述，填入 mnemonic_style / image_style / voice_style。
-7. 判断 scope（仅本轮 / 长期偏好）。
-8. 输出一个符合 Decision Schema 的 JSON 对象。
+5. 决定 audio_flow（语音与图片是并行、先图后声，还是只需要语音）。
+6. 决定 style_profile_id（结合历史值与本轮需求）。
+7. 解析谐音/图片/语音相关的风格描述，填入 mnemonic_style / image_style / voice_style。
+8. 判断 scope（仅本轮 / 长期偏好）。
+9. 输出一个符合 Decision Schema 的 JSON 对象。
 
 ---
 
@@ -321,6 +349,23 @@ mnemonic_agent_prompt = """
 
 ⚠️ 你的职责：
 接收一个【英语单词】和一组【风格参数】，输出一个包含音标、中文谐音、记忆故事、单词释义的结构化 JSON。
+
+---
+【音频与图片编排背景（audio_flow，仅供你知晓）】
+
+在整个系统中，你负责的谐音和故事，会被下游两个模块一起使用：
+- image_agent：根据你的 story 画出辅助记忆的图片；
+- tts_agent：根据你的谐音和 story 生成朗读音频。
+
+上游主理人决策智能体会有一个 audio_flow 字段，用来控制“图片生成”和“语音生成”的编排方式：
+- "parallel"：图片和语音可以并行生成；
+- "after_image"：先生成图片，再生成语音；
+- "audio_only"：只生成语音，不依赖图片。
+
+⚠️ 你不需要输出 audio_flow，也不需要根据 audio_flow 改变输出结构。
+但请注意：
+- 你的 story 既要有画面感，方便画图；
+- 也要适合朗读（读起来通顺、有节奏），方便生成语音。
 
 ---
 
@@ -355,6 +400,7 @@ mnemonic_agent_prompt = """
    - 必须包含：**单词谐音** + **中文含义**。
    - 将两者融合在一个画面感极强的短句中。
    - 故事长度控制在 20-60 字之间，短小精悍。
+   - 同时考虑“朗读效果”和“画面感”：读起来顺口、有节奏，画面清晰易想象。
 
 ---
 

@@ -22,7 +22,6 @@ from state import (
     MediaBlock,
     StylesBlock,
     StatusBlock,
-    WordMemoryResult,
     ImageGenOutput,
     TTSGenOutput,
     FinalReplyOutput,
@@ -31,7 +30,8 @@ from state import (
 from utils import (
     get_api_key_for_model,
     generate_image_tool,
-    tts_generation_tool
+    tts_generation_tool,
+    to_dict_or_self
 )
 from configuration import (
     EnglishAppConfig
@@ -50,13 +50,16 @@ from langgraph.checkpoint.memory import InMemorySaver
 from typing import Literal
 import json
 from datetime import datetime
-
+import asyncio
+from dotenv import load_dotenv
 
 
 # Initialize a configurable model that we will use throughout the agent
 configurable_model = init_chat_model(
     configurable_fields=("model", "temperature", "api_key"),
 )
+# 加载.env文件
+load_dotenv()  # 等同于 load_dotenv(".env")
 
 async def main_agent_logic(
     state: AgentState,
@@ -71,7 +74,9 @@ async def main_agent_logic(
     configurable = EnglishAppConfig.from_runnable_config(config)
 
     # Step 2:Prepare the prompt with current state
-    messages = state.messages[-1].content if state.messages else ""
+    last_msg = state.get("messages", [])
+    messages = last_msg[-1].content if last_msg else ""
+
     model_config = {
         "model": configurable.llm.main_agent_model,
         "temperature": configurable.llm.main_agent_temperature,
@@ -79,7 +84,7 @@ async def main_agent_logic(
     }
 
     # build json string of current state
-    current_style_id = state['style_profile_id'] or configurable.defaults.default_style_profile_id
+    current_style_id = state.get("style_profile_id") or configurable.defaults.default_style_profile_id
 
     state_context = {
         "word": state.get("word"),
@@ -87,9 +92,9 @@ async def main_agent_logic(
         "image_url": state.get("image_url"),
         "audio_url": state.get("audio_url"),
         "style_profile_id": current_style_id,
-        "user_mnemonic_pref": state.get("user_mnemonic_pref").model_dump() if state.get("user_mnemonic_pref") else None,
-        "user_image_pref": state.get("user_image_pref").model_dump() if state.get("user_image_pref") else None,
-        "user_voice_pref": state.get("user_voice_pref").model_dump() if state.get("user_voice_pref") else None,
+        "user_mnemonic_pref": to_dict_or_self(state.get("user_mnemonic_pref")) if state.get("user_mnemonic_pref") else None,
+        "user_image_pref": to_dict_or_self(state.get("user_image_pref")) if state.get("user_image_pref") else None,
+        "user_voice_pref": to_dict_or_self(state.get("user_voice_pref")) if state.get("user_voice_pref") else None,
         # 把上一轮的决策放入 context，帮助 LLM 理解连续对话
         "last_decision": state.get("last_decision") 
     }
@@ -111,6 +116,10 @@ async def main_agent_logic(
     )
 
     decision = await model.ainvoke([HumanMessage(content=prompt)])
+
+    # new_word 一定要有 mnemonic
+    if decision.intent == "new_word":
+        decision.need_new_mnemonic = True
 
     # Route based on the decision
     if decision.need_new_image and not configurable.features.enable_image_generation:
@@ -208,22 +217,50 @@ async def main_agent_logic(
         )
 
     # 场景 B: 不需要改文字，只改多媒体
-    # 例如：intent="change_image" 或 "change_audio"
-    next_nodes = []
-    
-    # 只有在不需要新 mnemonic 时，我们才考虑并行或直接跳转 image/tts
-    # 否则都由 mnemonic_agent 结束后的逻辑来触发它们
-    if decision.need_new_image:
-        next_nodes.append("generate_image")
-        
-    if decision.need_new_audio:
-        next_nodes.append("generate_tts")
-        
-    if next_nodes:
+    need_img = decision.need_new_image
+    need_audio = decision.need_new_audio
+    audio_flow = decision.audio_flow  # "parallel" | "after_image" | "audio_only"
+
+    # 1) 既要图又要音
+    if need_img and need_audio:
+        if audio_flow == "parallel":
+            # 并行：主 agent 直接并行调图 + 音
+            return Command(
+                update=update_dict,
+                goto=["generate_image", "generate_tts"]
+            )
+        elif audio_flow == "after_image":
+            # 串行：先图，generate_image 结束后再跳转到 TTS
+            return Command(
+                update=update_dict,
+                goto="generate_image"
+            )
+        elif audio_flow == "audio_only":
+            # 理论上不会出现“既要图又 audio_only”，这里兜底：只走语音
+            return Command(
+                update=update_dict,
+                goto="generate_tts"
+            )
+
+    # 2) 只要图片
+    if need_img and not need_audio:
         return Command(
             update=update_dict,
-            goto=next_nodes # 如果列表有多个，LangGraph 会并行执行
+            goto="generate_image"
         )
+
+    # 3) 只要语音
+    if need_audio and not need_img:
+        return Command(
+            update=update_dict,
+            goto="generate_tts"
+        )
+
+    # 4) 都不要：直接终点
+    return Command(
+        update=update_dict,
+        goto="final_result"
+    )
     
     # 场景 C: 不需要生成任何内容
     # 例如：intent="explain", "small_talk", "out_of_scope", "update_preferences"
@@ -304,36 +341,56 @@ async def generate_mnemonic(state: AgentState,
         "mnemonic": response.homophone.text,
         "scene_text": response.story,
         "meaning": response.meaning.cn,
-        "word_block_partial": {
-            "word": target_word,
-            "phonetic": response.phonetic.model_dump(),
-            "homophone": response.homophone.model_dump(),
-            "meaning": response.meaning.model_dump(),
-            "story": response.story
-        }
+        "word_block_partial": response
     }
 
     # ========== 6. 关键路由逻辑 (Routing) ==========
     # 任务已完成，现在查看 Main Agent 的原始决策，决定下一步去哪里
-    next_nodes = []
+    if not decision:
+        return Command(update=update_dict, goto="final_result")
 
-    if decision:
-        if decision.need_new_image:
-            next_nodes.append("generate_image")
-            
-        if decision.need_new_audio:
-            next_nodes.append("generate_tts")
-    
-    if next_nodes:
+    need_img = decision.need_new_image
+    need_audio = decision.need_new_audio
+    audio_flow = decision.audio_flow  # "parallel" | "after_image" | "audio_only"
+
+    # 1) 图 + 声
+    if need_img and need_audio:
+        if audio_flow == "parallel":
+            return Command(
+                update=update_dict,
+                goto=["generate_image", "generate_tts"]
+            )
+        elif audio_flow == "after_image":
+            return Command(
+                update=update_dict,
+                goto="generate_image"
+            )
+        elif audio_flow == "audio_only":
+            # 冲突兜底：只做语音
+            return Command(
+                update=update_dict,
+                goto="generate_tts"
+            )
+
+    # 2) 只要图
+    if need_img and not need_audio:
         return Command(
             update=update_dict,
-            goto=next_nodes # 如果列表有多个，LangGraph 会并行执行
+            goto="generate_image"
         )
-    else:
+
+    # 3) 只要音频
+    if need_audio and not need_img:
         return Command(
             update=update_dict,
-            goto="final_result"
+            goto="generate_tts"
         )
+
+    # 4) 都不要
+    return Command(
+        update=update_dict,
+        goto="final_result"
+    )
 
 async def generate_image(state: AgentState,
                          config: RunnableConfig) -> Command[Literal["generate_tts", "final_result"]]:
@@ -406,19 +463,21 @@ async def generate_image(state: AgentState,
     if image_url:
         update_dict["image_url"] = image_url
     
-    # 检查是否需要去 TTS 节点
-    # 条件：Decision 要求有语音 + Config 允许语音
+    # 4. 路由逻辑：
+    #    只有在 audio_flow == "after_image" 的场景，才由图片节点串到 TTS
     need_audio = decision and decision.need_new_audio
     audio_enabled = configurable.features.enable_tts_generation
-    
-    if need_audio and audio_enabled:
-        # 串行流：图片画完了，去录音
+    audio_flow = decision.audio_flow if decision else "parallel"
+
+    if need_audio and audio_enabled and audio_flow == "after_image":
+        # 串行模式：图片完成后进入语音生成
         return Command(
             update=update_dict,
             goto="generate_tts"
         )
     else:
-        # 不需要录音（或者被禁用），直接结束
+        # 并行模式（parallel）下，TTS 已由 main_agent 或 generate_mnemonic 并行触发；
+        # 或者本轮根本不需要语音 → 直接汇总
         return Command(
             update=update_dict,
             goto="final_result"
@@ -449,7 +508,7 @@ async def generate_tts(state: AgentState,
     # 3. 数据准备 (Data Prep)
     target_word = decision.word if decision and decision.word else state.get("word")
     mnemonic_text = state.get("mnemonic")
-    story_text = state.get("story")
+    story_text = state.get("scene_text")
 
     if not (target_word and mnemonic_text and story_text):
         print(f"⚠️ [TTS Agent] Missing text components for '{target_word}'. Skipping.")
@@ -463,7 +522,6 @@ async def generate_tts(state: AgentState,
 
     # 4. 确定语音风格 (Style Resolution)
     # 优先级：本轮决策 > 用户长期偏好 > 系统默认
-    decision = state.get("decision")
     final_voice_style = None
 
     # A. 本轮决策
@@ -525,7 +583,8 @@ async def generate_tts(state: AgentState,
     # 指向 final_result，配合 LangGraph 并行机制
     return Command(
         update={
-            "audio_url": audio_url
+            "audio_url": audio_url,
+            "audio_voice_profile_id": final_voice_id,  # 新字段
         },
         goto="final_result"
     )
@@ -548,9 +607,19 @@ async def final_result(state: AgentState,
     # 获取基础元数据
     intent = decision.intent if decision else "unknown"
     target_word = decision.word if decision and decision.word else state.get("word") or "unknown"
-    current_style_id = state['style_profile_id'] or configurable.defaults.default_style_profile_id
+    current_style_id = state.get("style_profile_id") or configurable.defaults.default_style_profile_id
 
     # 准备最终输出的 Prompt
+    """
+    formatted_prompt = final_result_prompt\
+    .replace("{intent}", intent)\
+    .replace("{word}", target_word)\
+    .replace("{style_profile_id}", current_style_id)\
+    .replace("{mnemonic}", state.get("mnemonic") or "")\
+    .replace("{scene_text}", state.get("scene_text") or "")\
+    .replace("{meaning}", state.get("meaning") or "")
+
+    """
     formatted_prompt = final_result_prompt.replace("{intent}", intent)\
                                           .replace("{word}", target_word)\
                                           .replace("{style_profile_id}", current_style_id)
@@ -567,10 +636,27 @@ async def final_result(state: AgentState,
     # 异常处理 (Out of Scope)
     if intent == "out_of_scope":
          # 如果超纲，只返回 reply_text，不构造 WordMemoryResult (或者构造一个空的)
+        status_block_obj = StatusBlock(
+            is_first_time=False,
+            intent=intent,
+            updated_parts=[],
+            scope=decision.scope if decision else "this_turn",
+            reason=decision.reason if decision else "out_of_scope"
+        )
+
+        final_result_obj = WordMemoryResult(
+            type="word_memory",
+            intent=intent,
+            word_block=None,
+            media=None,
+            styles=None,
+            status=status_block_obj
+        )
+
         return Command(
             update={
                 "reply_text": final_reply_text,
-                "final_output": None # 标记为无数据
+                "final_output": final_result_obj # 标记为无数据
             },
             goto=END
         )
@@ -580,6 +666,8 @@ async def final_result(state: AgentState,
     partial = state.get("word_block_partial")
 
     if partial and isinstance(partial, dict):
+        word_block_obj = partial
+    elif isinstance(partial, dict):
         word_block_obj = WordBlock(**partial)
     else:
         # 降级策略：如果 mnemonic 没运行(如只改图)，从 state 扁平字段拼凑
@@ -620,13 +708,9 @@ async def final_result(state: AgentState,
     # 检查 Audio
     audio_obj = None
     if state.get("audio_url"):
-        v_preset = None
-        if decision and decision.voice_style:
-            v_preset = decision.voice_style.preset_id
-            
         audio_obj = AudioMedia(
             url=state.get("audio_url"),
-            voice_profile_id=v_preset,
+            voice_profile_id=state.get("audio_voice_profile_id"),
             duration_sec=0.0, # 需后端计算，此处占位
             updated_at=datetime.now().isoformat()
         )
@@ -675,13 +759,13 @@ async def final_result(state: AgentState,
     return Command(
         update={
             "reply_text": final_reply_text,
-            "final_output": final_result_obj.model_dump()
+            "final_output": final_result_obj
         },
         goto=END
     )
 
 
-english_app_agent_graph = StateGraph(AgentState, input=AgentInputState)
+english_app_agent_graph = StateGraph(AgentState)
 english_app_agent_graph.add_node("main_agent_logic", main_agent_logic)
 english_app_agent_graph.add_node("generate_mnemonic", generate_mnemonic)
 english_app_agent_graph.add_node("generate_image", generate_image)
@@ -694,5 +778,13 @@ english_app_agent_graph.add_edge("final_result", END)
 config = {"configurable": {"thread_id": 1}}
 store = InMemorySaver()
 
-app_agent = english_app_agent_graph.compile(store=store, config=config)
+app_agent = english_app_agent_graph.compile(store=store)
 
+# async def run_agent():
+#     input_data = {
+#         "messages": [HumanMessage(content="I want to learn the word 'serendipity'.")]
+#     }
+#     result = await app_agent.ainvoke(input_data, config=config)
+#     print(result)
+
+# asyncio.run(run_agent())

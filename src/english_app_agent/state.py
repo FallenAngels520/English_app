@@ -118,6 +118,17 @@ class Decision(BaseModel):
         description="语音合成的风格参数"
     )
 
+    # ⭐ 新增：语音与图片的编排方式
+    audio_flow: Literal["parallel", "after_image", "audio_only"] = Field(
+        "parallel",
+        description=(
+            "TTS 和图片的编排方式："
+            "parallel=和图片并行；"
+            "after_image=图片完成后再生成语音；"
+            "audio_only=只生成语音，不依赖图片"
+        )
+    )
+
     # 设置作用范围：仅当前轮次 or 作为会话/长期默认
     scope: Literal["this_turn", "session_default"] = Field(
         "this_turn",
@@ -350,6 +361,11 @@ class AgentState(MessagesState):
     # —— 风格档位 & 长期偏好 ——
     style_profile_id: Optional[str]  # simple_clean / funny / aggressive / dongbei_funny / other
 
+    # 语音实际使用的 profile id（由 generate_tts 填）
+    audio_voice_profile_id: Optional[str]
+
+    word_block_partial: Optional[WordBlock]  # 部分填充的 WordBlock（用于增量更新）
+
     user_mnemonic_pref: Optional[MnemonicStyle]
     user_image_pref: Optional[ImageStyle]
     user_voice_pref: Optional[VoiceStyle]
@@ -357,9 +373,10 @@ class AgentState(MessagesState):
     # —— 其他：上一轮决策快照（可选）——
     last_decision: Optional[dict]
 
-    reply_text: Optional[str]        # 给前端的文案（在 reply 节点设置）
+    # 给前端的文案（在 reply 节点设置）
+    reply_text: Optional[str]        
 
-    final_output: Optional[str]     # 最终输出结果（包含所有生成内容）
+    final_output: Optional[WordMemoryResult]     # 最终输出结果（包含所有生成内容）
 
 # 图片生成agent的输出结构
 class ImageGenOutput(BaseModel):
