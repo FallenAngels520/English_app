@@ -452,8 +452,8 @@ async def generate_image(state: AgentState,
         response = await model.ainvoke([HumanMessage(content=formatted_prompt)])
 
         try:
-            # 调用图片生成工具 (假设有一个 generate_image_tool 函数)
-            image_url = await generate_image_tool(response.image_prompt, final_image_style.model_dump())
+            # 调用图片生成工具 (假设有一个 image_generation_tool 函数)
+            image_url = await generate_image_tool(response.image_prompt, response.negative_prompt, json.loads(style_json), api_key=get_api_key_for_model("qwen", config))
         except Exception as e:
             print(f"❌ [Image Agent] Failed: {e}")
             # 图片失败不阻断流程，继续往下走
@@ -572,8 +572,7 @@ async def generate_tts(state: AgentState,
         # 调用语音生成工具 (假设有一个 generate_audio_tool 函数)
         audio_url = await tts_generation_tool(
             text=response.text_to_speak,
-            voice_profile_id=final_voice_id,
-            speed=response.speed_rate
+            api_key=get_api_key_for_model("qwen-tts", config)
             )
     except Exception as e:
         print(f"❌ [TTS Agent] Failed: {e}")
@@ -782,7 +781,7 @@ app_agent = english_app_agent_graph.compile(store=store)
 
 # async def run_agent():
 #     input_data = {
-#         "messages": [HumanMessage(content="I want to learn the word 'serendipity'.")]
+#         "messages": [HumanMessage(content="I want to learn the word 'Ambulance'.")]
 #     }
 #     result = await app_agent.ainvoke(input_data, config=config)
 #     print(result)

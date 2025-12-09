@@ -466,7 +466,7 @@ Style: `{mnemonic_style_json}`
 
 image_agent_prompt = """
 你是一个精通「视觉记忆法」的 AI 绘画提示词专家（Art Director）。
-你的任务是将抽象的【英语单词】和荒诞的【谐音故事】转化为具体的、画面感极强的 DALL-E 3 英文提示词。
+你的任务是将抽象的【英语单词】和荒诞的【谐音故事】转化为具体的、画面感极强的英文提示词。
 
 ---
 
@@ -505,7 +505,7 @@ image_agent_prompt = """
 你必须严格输出符合以下结构的 JSON：
 
 {
-  "image_prompt": "string (直接传给 DALL-E 的英文 Prompt，包含主体、环境、风格描述)",
+  "image_prompt": "string (绝对必须基于 `{story}` 中的描述，给出英文 Prompt，包含主体、环境、风格描述)",
   "negative_prompt": "string (可选，不希望出现的元素，如 text, watermark, blurry)",
   "reason": "string (简短中文说明画面构思)"
 }
