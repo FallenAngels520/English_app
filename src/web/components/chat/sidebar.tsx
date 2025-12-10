@@ -3,7 +3,7 @@
 import { Conversation } from '@/types/chat';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
-import { Plus, MessageSquare, Trash2 } from 'lucide-react';
+import { Plus, MessageSquare, Trash2, BookOpen } from 'lucide-react';
 import { ThemeToggle } from '@/components/theme-toggle';
 
 interface SidebarProps {
@@ -12,14 +12,26 @@ interface SidebarProps {
   onSelect: (id: string) => void;
   onCreate: () => void;
   onDelete: (id: string) => void;
+  onOpenLibrary: () => void;
+  hasLibraryItems: boolean;
 }
 
-export function Sidebar({ sessions, activeId, onSelect, onCreate, onDelete }: SidebarProps) {
+export function Sidebar({ sessions, activeId, onSelect, onCreate, onDelete, onOpenLibrary, hasLibraryItems }: SidebarProps) {
   return (
     <aside className="flex h-full w-64 flex-shrink-0 flex-col border-r bg-card">
       <div className="flex items-center justify-between border-b px-4 py-3">
         <Button onClick={onCreate} className="w-full gap-2" variant="default">
           <Plus className="h-4 w-4" /> 新会话
+        </Button>
+      </div>
+      <div className="border-b px-4 pb-3">
+        <Button
+          onClick={onOpenLibrary}
+          className="w-full gap-2"
+          variant="secondary"
+          disabled={!hasLibraryItems}
+        >
+          <BookOpen className="h-4 w-4" /> 卡片库
         </Button>
       </div>
       <div className="flex-1 overflow-y-auto p-2 chat-scroll">

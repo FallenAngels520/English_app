@@ -1,44 +1,56 @@
 import { NextResponse } from 'next/server';
 
-interface IncomingMessage {
+interface OutgoingMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
 }
 
+const DEFAULT_BACKEND_URL = process.env.AGENT_API_BASE_URL ?? 'http://127.0.0.1:8000';
+
 export async function POST(request: Request) {
-  const { messages = [] } = await request.json();
-  const lastUserMessage = [...messages].reverse().find((message: IncomingMessage) => message.role === 'user');
+  const { messages = [], sessionId, configurable } = await request.json();
 
-  const prompt = lastUserMessage?.content ?? 'No question provided.';
-  const suggestion = `这里有一个学习建议：尝试把“${prompt.slice(0, 40)}”扩展成至少三个例句。`;
-  const mockReply = `你刚刚说的是：\n\n${prompt}\n\n${suggestion}\n\n**知识点**\n\n1. 识别关键信息并用自己的话改写。\n2. 把抽象概念拆解成简单的步骤。\n3. 如果需要代码，先写伪代码再实现。`;
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return NextResponse.json({ error: 'messages is required' }, { status: 400 });
+  }
 
-  const encoder = new TextEncoder();
-  const signal = request.signal;
+  const payload = {
+    session_id: typeof sessionId === 'string' && sessionId.trim().length > 0 ? sessionId : 'default',
+    configurable: typeof configurable === 'object' && configurable != null ? configurable : undefined,
+    messages: (messages as OutgoingMessage[]).map((message) => ({
+      role: message.role,
+      content: message.content ?? ''
+    }))
+  };
 
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const chunks = mockReply.split(/(\s+)/).filter(Boolean);
-      const abortHandler = () => {
-        controller.close();
-      };
-      signal.addEventListener('abort', abortHandler);
-      try {
-        for (const chunk of chunks) {
-          if (signal.aborted) break;
-          controller.enqueue(encoder.encode(chunk));
-          await new Promise((resolve) => setTimeout(resolve, 80));
-        }
-      } finally {
-        signal.removeEventListener('abort', abortHandler);
-        controller.close();
-      }
+  let backendResponse: Response;
+  try {
+    backendResponse = await fetch(`${DEFAULT_BACKEND_URL}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  } catch (networkError) {
+    return NextResponse.json(
+      { error: `无法连接到后台服务: ${(networkError as Error).message}` },
+      { status: 502 }
+    );
+  }
+
+  const text = await backendResponse.text();
+  let data: unknown = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { detail: text };
     }
-  });
+  }
 
-  return new NextResponse(stream, {
-    headers: {
-      'Content-Type': 'text/plain; charset=utf-8'
-    }
-  });
+  if (!backendResponse.ok) {
+    const detail = (data as { detail?: string })?.detail ?? 'Backend error';
+    return NextResponse.json({ error: detail }, { status: backendResponse.status });
+  }
+
+  return NextResponse.json(data);
 }

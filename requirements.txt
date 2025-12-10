@@ -1,0 +1,12 @@
+langchain
+langgraph
+pydantic
+fastapi
+uvicorn[standard]
+python-dotenv
+dashscope
+google-genai
+Pillow
+typing_extensions
+sqlalchemy
+oss2

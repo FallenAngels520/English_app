@@ -6,7 +6,7 @@ from langchain_core.messages import (
     HumanMessage,
 )
 
-from state import (
+from .state import (
     Decision,
     AgentState,
     WordMemoryResult,
@@ -27,17 +27,17 @@ from state import (
     FinalReplyOutput,
     AgentInputState
     )
-from utils import (
+from .utils import (
     get_api_key_for_model,
     generate_image_tool,
     tts_generation_tool,
     to_dict_or_self
 )
-from configuration import (
+from .configuration import (
     EnglishAppConfig
     )
 
-from prompt import(
+from .prompt import(
     main_agent_prompt,
     mnemonic_agent_prompt,
     image_agent_prompt,
@@ -664,10 +664,8 @@ async def final_result(state: AgentState,
     # --- A. 组装 WordBlock ---
     partial = state.get("word_block_partial")
 
-    if partial and isinstance(partial, dict):
+    if partial and isinstance(partial, WordBlock):
         word_block_obj = partial
-    elif isinstance(partial, dict):
-        word_block_obj = WordBlock(**partial)
     else:
         # 降级策略：如果 mnemonic 没运行(如只改图)，从 state 扁平字段拼凑
         # 这种情况下音标(ipa)可能会缺失，需给默认值

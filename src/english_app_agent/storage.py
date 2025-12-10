@@ -1,0 +1,435 @@
+from __future__ import annotations
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+import urllib.request
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+from urllib.parse import urlparse
+
+from pydantic import BaseModel
+from sqlalchemy import JSON as SAJSON
+from sqlalchemy import Column, DateTime, Integer, MetaData, String, Table, create_engine, func
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import SQLAlchemyError
+
+try:
+    import oss2  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    oss2 = None
+
+from .storage_config import (
+    CacheArchiveConfig,
+    LocalCacheConfig,
+    MediaStorageConfig,
+    RemoteDatabaseConfig,
+    StorageConfig,
+)
+from .state import WordMemoryResult
+
+logger = logging.getLogger(__name__)
+
+
+class LocalCacheStorage:
+    def __init__(self, config: LocalCacheConfig):
+        self.config = config
+        self.base_dir = Path(config.directory).expanduser()
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.max_entries = max(1, config.max_entries)
+
+    def save(self, payload: Dict[str, Any]) -> None:
+        timestamp = datetime.utcnow().isoformat()
+        enriched = dict(payload)
+        enriched.setdefault("cached_at", timestamp)
+        file_name = f"{payload['session_id']}-{int(time.time() * 1000)}.json"
+        enriched.setdefault("record_id", file_name)
+        target_path = self.base_dir / file_name
+        target_path.write_text(json.dumps(enriched, ensure_ascii=False), encoding="utf-8")
+        self._evict()
+
+    def _evict(self) -> None:
+        files = sorted(self.base_dir.glob("*.json"), key=lambda item: item.stat().st_mtime)
+        while len(files) > self.max_entries:
+            oldest = files.pop(0)
+            try:
+                oldest.unlink(missing_ok=True)
+            except OSError as exc:  # pragma: no cover - best effort cleanup
+                logger.warning("Failed to delete cache file %s: %s", oldest, exc)
+
+
+class DatabaseStorage:
+    def __init__(self, config: RemoteDatabaseConfig):
+        if not config.url:
+            raise ValueError("Database URL is required when remote database storage is enabled.")
+        self.engine = create_engine(config.url, future=True)
+        self.metadata = MetaData()
+        json_type = SAJSON().with_variant(JSONB, "postgresql")
+        self.table = Table(
+            config.table_name,
+            self.metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("session_id", String(128), index=True, nullable=False),
+            Column("created_at", DateTime(timezone=True), server_default=func.now()),
+            Column("request_payload", json_type, nullable=False),
+            Column("response_payload", json_type, nullable=False),
+        )
+        self.metadata.create_all(self.engine, checkfirst=True)
+
+    def save(self, payload: Dict[str, Any]) -> None:
+        with self.engine.begin() as connection:
+            connection.execute(
+                self.table.insert().values(
+                    session_id=payload["session_id"],
+                    created_at=datetime.utcnow(),
+                    request_payload=payload["request"],
+                    response_payload=payload["response"],
+                )
+            )
+
+
+class AliyunOSSStorage:
+    def __init__(self, config: MediaStorageConfig | CacheArchiveConfig):
+        if oss2 is None:
+            raise RuntimeError("oss2 package is required for Aliyun OSS media storage.")
+        if not all([config.bucket, config.endpoint, config.access_key_id, config.access_key_secret]):
+            raise ValueError("Aliyun OSS storage is missing required configuration.")
+
+        auth = oss2.Auth(config.access_key_id, config.access_key_secret)
+        self.bucket_name = config.bucket
+        self.endpoint = config.endpoint
+        self.prefix = config.prefix.strip("/")
+        self.bucket = oss2.Bucket(auth, config.endpoint, config.bucket)
+
+    def upload_from_url(self, url: str, category: str) -> Optional[str]:
+        if not url:
+            return None
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                data = response.read()
+        except Exception as exc:  # pragma: no cover - network errors handled at runtime
+            logger.warning("Failed to download media [%s]: %s", url, exc)
+            return None
+
+        suffix = Path(urlparse(url).path).suffix or ".bin"
+        key = f"{self.prefix}/{category}/{uuid.uuid4().hex}{suffix}"
+        try:
+            self.bucket.put_object(key, data)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Failed to upload media to OSS: %s", exc)
+            return None
+
+        sanitized_endpoint = self.endpoint.replace("https://", "").replace("http://", "")
+        return f"https://{self.bucket_name}.{sanitized_endpoint}/{key}"
+
+    def upload_bytes(self, key: str, data: bytes) -> None:
+        self.bucket.put_object(key, data)
+
+    def list_object_keys(self, prefix: str, max_keys: int = 100) -> list[str]:
+        result = self.bucket.list_objects(prefix=prefix, max_keys=max_keys)
+        return [obj.key for obj in result.object_list or []]
+
+    def download_object(self, key: str) -> Optional[bytes]:
+        try:
+            result = self.bucket.get_object(key)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Failed to download object %s: %s", key, exc)
+            return None
+        return result.read()
+
+
+class StorageManager:
+    def __init__(self):
+        self._local_cache_instances: Dict[str, LocalCacheStorage] = {}
+        self._db_instances: Dict[str, DatabaseStorage] = {}
+        self._media_instances: Dict[str, AliyunOSSStorage] = {}
+        self._archive_instances: Dict[str, AliyunOSSStorage] = {}
+
+    async def mirror_media_if_needed(
+        self,
+        final_output: Optional[WordMemoryResult],
+        media_config: MediaStorageConfig,
+    ) -> Optional[WordMemoryResult]:
+        if not final_output or not media_config.enable or media_config.provider != "aliyun_oss":
+            return final_output
+        try:
+            client = self._get_media_storage(media_config)
+        except Exception as exc:
+            logger.warning("Media storage unavailable: %s", exc)
+            return final_output
+
+        updated = final_output.model_copy(deep=True)
+        media = updated.media
+        if not media:
+            return updated
+
+        if media.image and media.image.url:
+            new_url = await asyncio.to_thread(client.upload_from_url, media.image.url, "images")
+            if new_url:
+                media.image.url = new_url
+
+        if media.audio and media.audio.url:
+            new_url = await asyncio.to_thread(client.upload_from_url, media.audio.url, "audio")
+            if new_url:
+                media.audio.url = new_url
+
+        return updated
+
+    async def persist_response(
+        self,
+        *,
+        session_id: str,
+        request_payload: Any,
+        response_payload: BaseModel,
+        storage_config: StorageConfig,
+    ) -> None:
+        serialized_request = self._to_dict(request_payload)
+        serialized_response = self._to_dict(response_payload)
+        record = {
+            "session_id": session_id,
+            "request": serialized_request,
+            "response": serialized_response,
+        }
+
+        tasks = []
+        if storage_config.local_cache.enable:
+            local_cache = self._get_local_cache(storage_config.local_cache)
+            tasks.append(asyncio.to_thread(local_cache.save, record))
+
+        remote_db_cfg = storage_config.remote_database
+        if remote_db_cfg.enable and remote_db_cfg.url:
+            db_store = self._get_database_storage(remote_db_cfg)
+            tasks.append(asyncio.to_thread(self._safe_db_write, db_store, record))
+
+        archive_cfg = storage_config.archive
+        if archive_cfg.enable and archive_cfg.provider == "aliyun_oss":
+            archive_store = self._get_archive_storage(archive_cfg)
+            tasks.append(asyncio.to_thread(self._upload_archive_record, archive_store, archive_cfg, record))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _get_local_cache(self, config: LocalCacheConfig) -> LocalCacheStorage:
+        key = str(Path(config.directory).expanduser().resolve())
+        if key not in self._local_cache_instances:
+            self._local_cache_instances[key] = LocalCacheStorage(config)
+        return self._local_cache_instances[key]
+
+    def _get_database_storage(self, config: RemoteDatabaseConfig) -> DatabaseStorage:
+        key = f"{config.url}:{config.table_name}"
+        if key not in self._db_instances:
+            self._db_instances[key] = DatabaseStorage(config)
+        return self._db_instances[key]
+
+    def _get_media_storage(self, config: MediaStorageConfig) -> AliyunOSSStorage:
+        key = f"{config.bucket}:{config.endpoint}:{config.prefix}"
+        if key not in self._media_instances:
+            self._media_instances[key] = AliyunOSSStorage(config)
+        return self._media_instances[key]
+
+    def _get_archive_storage(self, config: CacheArchiveConfig) -> AliyunOSSStorage:
+        key = f"{config.bucket}:{config.endpoint}:{config.prefix}"
+        if key not in self._archive_instances:
+            self._archive_instances[key] = AliyunOSSStorage(config)
+        return self._archive_instances[key]
+
+    @staticmethod
+    def _to_dict(payload: Any) -> Dict[str, Any]:
+        if isinstance(payload, BaseModel):
+            return payload.model_dump()
+        if isinstance(payload, dict):
+            return payload
+        raise TypeError("Payload must be a Pydantic model or dict.")
+
+    @staticmethod
+    def _safe_db_write(store: DatabaseStorage, record: Dict[str, Any]) -> None:
+        try:
+            store.save(record)
+        except SQLAlchemyError as exc:  # pragma: no cover
+            logger.warning("Failed to persist record to database: %s", exc)
+
+    @staticmethod
+    def _upload_archive_record(store: AliyunOSSStorage, config: CacheArchiveConfig, record: Dict[str, Any]) -> None:
+        timestamp = int(time.time() * 1000)
+        file_name = record.get("record_id") or f"{record['session_id']}-{timestamp}.json"
+        key = "/".join([config.prefix.strip("/"), record["session_id"], file_name]).strip("/")
+        data = json.dumps(record, ensure_ascii=False).encode("utf-8")
+        store.upload_bytes(key, data)
+
+    async def load_cached_records(
+        self,
+        session_id: str,
+        storage_config: StorageConfig,
+        limit: int = 20,
+    ) -> list[Dict[str, Any]]:
+        records = self._load_local_records(session_id, storage_config.local_cache, limit)
+        if records:
+            return records
+
+        archive_cfg = storage_config.archive
+        if archive_cfg.enable and archive_cfg.provider == "aliyun_oss":
+            archive_store = self._get_archive_storage(archive_cfg)
+            downloaded = await asyncio.to_thread(
+                self._download_archive_records,
+                archive_store,
+                archive_cfg,
+                storage_config.local_cache,
+                session_id,
+                limit,
+            )
+            if downloaded:
+                return downloaded
+        return []
+
+    def _load_local_records(
+        self,
+        session_id: str,
+        cache_config: LocalCacheConfig,
+        limit: int,
+    ) -> list[Dict[str, Any]]:
+        base_dir = Path(cache_config.directory).expanduser()
+        if not base_dir.exists():
+            return []
+
+        pattern = f"{session_id}-*.json"
+        files = sorted(
+            [p for p in base_dir.glob(pattern) if p.is_file()],
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        result: list[Dict[str, Any]] = []
+        for path in files[:limit]:
+            record = self._load_record_file(path)
+            if record:
+                result.append(record)
+        return result
+
+    def _download_archive_records(
+        self,
+        store: AliyunOSSStorage,
+        archive_config: CacheArchiveConfig,
+        cache_config: LocalCacheConfig,
+        session_id: str,
+        limit: int,
+    ) -> list[Dict[str, Any]]:
+        prefix = "/".join([archive_config.prefix.strip("/"), session_id]).strip("/") + "/"
+        keys = store.list_object_keys(prefix, max_keys=limit)
+        if not keys:
+            return []
+
+        base_dir = Path(cache_config.directory).expanduser()
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        results: list[Dict[str, Any]] = []
+        for key in keys:
+            data = store.download_object(key)
+            if not data:
+                continue
+            try:
+                record = json.loads(data.decode("utf-8"))
+            except json.JSONDecodeError:
+                continue
+            file_name = key.split("/")[-1]
+            record.setdefault("record_id", file_name)
+            try:
+                (base_dir / file_name).write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+            except OSError:
+                pass
+            results.append(record)
+        return results
+
+    def _load_record_file(self, path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        record.setdefault("record_id", path.name)
+        return record
+
+    def _download_single_archive_record(
+        self,
+        store: AliyunOSSStorage,
+        archive_config: CacheArchiveConfig,
+        cache_config: LocalCacheConfig,
+        session_id: str,
+        record_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        key = "/".join([archive_config.prefix.strip("/"), session_id, record_id]).strip("/")
+        data = store.download_object(key)
+        if not data:
+            return None
+        try:
+            record = json.loads(data.decode("utf-8"))
+        except json.JSONDecodeError:
+            return None
+        record.setdefault("record_id", record_id)
+        base_dir = Path(cache_config.directory).expanduser()
+        base_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            (base_dir / record_id).write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+        return record
+
+    def list_session_ids(self, storage_config: StorageConfig, max_sessions: int = 1000) -> List[str]:
+        ids: Set[str] = set()
+        base_dir = Path(storage_config.local_cache.directory).expanduser()
+        if base_dir.exists():
+            for path in base_dir.glob("*.json"):
+                prefix = path.name.split("-")[0]
+                if prefix:
+                    ids.add(prefix)
+                if len(ids) >= max_sessions:
+                    break
+
+        archive_cfg = storage_config.archive
+        if archive_cfg.enable and archive_cfg.provider == "aliyun_oss":
+            try:
+                archive_store = self._get_archive_storage(archive_cfg)
+                prefix = archive_cfg.prefix.strip("/")
+                oss_prefix = f"{prefix}/" if prefix else ""
+                keys = archive_store.list_object_keys(oss_prefix, max_keys=max_sessions)
+                for key in keys:
+                    remainder = key[len(oss_prefix):] if key.startswith(oss_prefix) else key
+                    parts = remainder.split("/", 1)
+                    if parts and parts[0]:
+                        ids.add(parts[0])
+                    if len(ids) >= max_sessions:
+                        break
+            except Exception as exc:
+                logger.warning("Failed to list archive session ids: %s", exc)
+
+        return sorted(ids)
+
+    async def load_record_by_id(
+        self,
+        session_id: str,
+        record_id: str,
+        storage_config: StorageConfig,
+    ) -> Optional[Dict[str, Any]]:
+        base_dir = Path(storage_config.local_cache.directory).expanduser()
+        path = base_dir / record_id
+        if path.exists():
+            record = self._load_record_file(path)
+            if record:
+                return record
+
+        archive_cfg = storage_config.archive
+        if archive_cfg.enable and archive_cfg.provider == "aliyun_oss":
+            archive_store = self._get_archive_storage(archive_cfg)
+            downloaded = await asyncio.to_thread(
+                self._download_single_archive_record,
+                archive_store,
+                archive_cfg,
+                storage_config.local_cache,
+                session_id,
+                record_id,
+            )
+            if downloaded:
+                return downloaded
+        return None
