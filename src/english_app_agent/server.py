@@ -1,10 +1,12 @@
 """FastAPI server that exposes the English app LangGraph agent."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
@@ -26,6 +28,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+
+def _mount_local_media_directory(target_app: FastAPI) -> None:
+    """Expose cached media files when local_fs storage is enabled."""
+    storage_config = load_storage_config(None)
+    media_cfg = storage_config.media
+    if not (media_cfg.enable and media_cfg.provider == "local_fs"):
+        return
+
+    media_root = Path(media_cfg.local_directory).expanduser()
+    media_root.mkdir(parents=True, exist_ok=True)
+
+    already_mounted = any(
+        getattr(route, "path", None) == "/media" for route in target_app.routes
+    )
+    if not already_mounted:
+        target_app.mount("/media", StaticFiles(directory=str(media_root)), name="media")
+
+
+_mount_local_media_directory(app)
 
 
 class MessagePayload(BaseModel):
@@ -97,7 +119,11 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
         final_output = WordMemoryResult(**final_output)
 
     if final_output:
-        final_output = await storage_manager.mirror_media_if_needed(final_output, storage_config.media)
+        final_output = await storage_manager.mirror_media_if_needed(
+            final_output,
+            storage_config.media,
+            session_id=request.session_id,
+        )
 
     response_payload = ChatResponse(reply_text=reply_text, final_output=final_output)
 

@@ -53,6 +53,60 @@ Every successful `/chat` response flows through a tiered storage manager:
 
 Feature flags can be toggled via environment variables or by supplying a JSON blob under the `storage` key inside `RunnableConfig.configurable`.
 
+#### Configuring `storage_config.py`
+
+`src/english_app_agent/storage_config.py` reads settings from two sources (merged in this order):
+
+1. `RunnableConfig.configurable.storage` (useful for per-request overrides).
+2. Environment variables (best for `.env`/deployment defaults).
+
+Key env vars you can drop into `.env`:
+
+```ini
+# Local cache (defaults shown)
+LOCAL_CACHE_ENABLE=true
+LOCAL_CACHE_DIR=~/.english_app_agent/cache
+LOCAL_CACHE_MAX_ENTRIES=200
+
+# Remote DB
+REMOTE_DB_ENABLE=false
+REMOTE_DB_URL=postgresql+psycopg2://user:pass@host/dbname
+
+# Media mirroring
+MEDIA_ENABLE=true
+MEDIA_PROVIDER=local_fs        # or aliyun_oss / none
+MEDIA_LOCAL_DIRECTORY=~/.english_app_agent/media
+# Aliyun OSS-only fields:
+MEDIA_BUCKET=your-bucket
+MEDIA_ENDPOINT=https://oss-cn-hangzhou.aliyuncs.com
+MEDIA_ACCESS_KEY_ID=...
+MEDIA_ACCESS_KEY_SECRET=...
+MEDIA_PREFIX=chat_media/
+
+# Cache archive (optional OSS backup for records)
+ARCHIVE_ENABLE=false
+ARCHIVE_BUCKET=...
+ARCHIVE_ENDPOINT=...
+ARCHIVE_ACCESS_KEY_ID=...
+ARCHIVE_ACCESS_KEY_SECRET=...
+ARCHIVE_PREFIX=chat_cache/
+```
+
+When editing `storage_config.py`, keep the Pydantic models aligned with these env names—each field uses a helper (`_env_bool`, `_env_int`, or `os.getenv`). On the frontend/CLI side, pass overrides like:
+
+```python
+config = {
+    "configurable": {
+        "thread_id": "abc123",
+        "storage": {
+            "media": {"provider": "local_fs", "local_directory": "/tmp/english-app/media"}
+        }
+    }
+}
+```
+
+This lets you tailor caching/media policies per request without touching global env vars.
+
 ### Invoking the Agent Manually
 
 ```bash

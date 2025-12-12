@@ -47,7 +47,7 @@ from .prompt import(
 
 from langgraph.checkpoint.memory import InMemorySaver
 
-from typing import Literal
+from typing import Literal, Optional
 import json
 from datetime import datetime
 import asyncio
@@ -186,11 +186,31 @@ async def main_agent_logic(
 
     # 5. 准备状态更新 (State Update)
     # 这些内容会立即写入 StateGraph 的 checkpoint
+    had_existing_image = bool(state.get("image_url"))
+
+    if decision.need_new_mnemonic:
+        # Mnemonic/story 更新后，确保多媒体同步刷新
+        if configurable.features.enable_tts_generation:
+            decision.need_new_audio = True
+
+        if configurable.features.enable_image_generation and (had_existing_image or decision.need_new_image):
+            decision.need_new_image = True
+            if not decision.image_style:
+                decision.image_style = state.get("user_image_pref") or ImageStyle(
+                    need_image=True,
+                    style=configurable.defaults.default_image_style,
+                    mood=configurable.defaults.default_image_mood,
+                    extra_tags=[]
+                )
+
+    previous_word = state.get("word")
+    resolved_word = decision.word or previous_word
+
     update_dict = {
         "decision": decision,
         "last_decision": decision.model_dump(), # 存一下给下一轮参考
         # 如果是新词，更新 word；否则保持原样
-        "word": decision.word if decision.word else state["word"],
+        "word": resolved_word,
         # 总是更新当前风格 ID
         "style_profile_id": decision.style_profile_id or current_style_id
     }
@@ -632,30 +652,12 @@ async def final_result(state: AgentState,
     response = await model.ainvoke([HumanMessage(content=formatted_prompt)])
     final_reply_text = response.reply_text
 
-    # 异常处理 (Out of Scope)
-    if intent == "out_of_scope":
-         # 如果超纲，只返回 reply_text，不构造 WordMemoryResult (或者构造一个空的)
-        status_block_obj = StatusBlock(
-            is_first_time=False,
-            intent=intent,
-            updated_parts=[],
-            scope=decision.scope if decision else "this_turn",
-            reason=decision.reason if decision else "out_of_scope"
-        )
-
-        final_result_obj = WordMemoryResult(
-            type="word_memory",
-            intent=intent,
-            word_block=None,
-            media=None,
-            styles=None,
-            status=status_block_obj
-        )
-
+    # Small talk / Out of Scope: 不生成单词卡片
+    if intent in ["out_of_scope", "small_talk"]:
         return Command(
             update={
                 "reply_text": final_reply_text,
-                "final_output": final_result_obj # 标记为无数据
+                "final_output": None
             },
             goto=END
         )
@@ -772,16 +774,16 @@ english_app_agent_graph.add_node("final_result", final_result)
 english_app_agent_graph.add_edge(START, "main_agent_logic")
 english_app_agent_graph.add_edge("final_result", END)
 
-config = {"configurable": {"thread_id": 1}}
-store = InMemorySaver()
+config = {"configurable": {"thread_id": "english_app_agent_thread"}}
+checkpointer = InMemorySaver()
 
-app_agent = english_app_agent_graph.compile(store=store)
+app_agent = english_app_agent_graph.compile(checkpointer=checkpointer)
 
-# async def run_agent():
-#     input_data = {
-#         "messages": [HumanMessage(content="I want to learn the word 'Ambulance'.")]
-#     }
-#     result = await app_agent.ainvoke(input_data, config=config)
-#     print(result)
+async def run_agent():
+    input_data = {
+        "messages": [HumanMessage(content="帮我解释这个单词 'dependency' 并生成一个有趣的记忆方法。")],
+    }
+    result = await app_agent.ainvoke(input_data, config=config)
+    print(result)
 
-# asyncio.run(run_agent())
+asyncio.run(run_agent())

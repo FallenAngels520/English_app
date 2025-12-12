@@ -29,7 +29,11 @@ export const ChatMessage = memo(function ChatMessage({ message, isStreaming }: C
   const isUser = message.role === 'user';
   const bubbleClasses = isUser
     ? 'bg-primary text-primary-foreground ml-auto'
-    : cn('bg-muted text-foreground border border-border', message.error && 'border-destructive/60 text-destructive');
+    : cn(
+        'bg-muted text-foreground border border-border',
+        message.error && 'border-destructive/60 text-destructive'
+      );
+  const content = message.content || (isStreaming ? 'AI 正在思考…' : '');
 
   return (
     <div className={cn('flex w-full gap-3', isUser ? 'justify-end' : 'justify-start')}>
@@ -38,10 +42,16 @@ export const ChatMessage = memo(function ChatMessage({ message, isStreaming }: C
           AI
         </div>
       )}
-      <div className={cn('max-w-[75%] rounded-2xl px-4 py-3 text-sm shadow-sm', bubbleClasses)}>
+      <div
+        className={cn(
+          'max-w-[min(720px,85%)] rounded-2xl px-4 py-3 text-sm shadow-sm transition-all',
+          bubbleClasses
+        )}
+        aria-live={isStreaming ? 'polite' : 'off'}
+      >
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
-          className="markdown-body"
+          className="markdown-body break-words text-[0.95rem]"
           components={{
             code({ node, inline, className, children, ...props }) {
               const match = /language-(\w+)/.exec(className ?? '');
@@ -68,7 +78,7 @@ export const ChatMessage = memo(function ChatMessage({ message, isStreaming }: C
             }
           }}
         >
-          {message.content || (isStreaming ? 'AI 正在思考…' : '')}
+          {content}
         </ReactMarkdown>
         {message.error && <p className="mt-2 text-xs text-destructive">生成失败，请重试</p>}
       </div>

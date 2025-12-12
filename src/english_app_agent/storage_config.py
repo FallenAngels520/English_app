@@ -25,12 +25,13 @@ class RemoteDatabaseConfig(BaseModel):
 
 class MediaStorageConfig(BaseModel):
     enable: bool = False
-    provider: Literal["aliyun_oss", "none"] = "none"
+    provider: Literal["aliyun_oss", "local_fs", "none"] = "none"
     bucket: Optional[str] = None
     endpoint: Optional[str] = None
     access_key_id: Optional[str] = None
     access_key_secret: Optional[str] = None
     prefix: str = "chat_media/"
+    local_directory: str = os.path.expanduser("~/.english_app_agent/media")
 
 
 class CacheArchiveConfig(BaseModel):
@@ -96,6 +97,10 @@ def load_storage_config(config: Optional[RunnableConfig]) -> StorageConfig:
             "MEDIA_ACCESS_KEY_SECRET", media_cfg.get("access_key_secret", cfg.media.access_key_secret)
         ),
         prefix=media_cfg.get("prefix", cfg.media.prefix),
+        local_directory=os.getenv(
+            "MEDIA_LOCAL_DIRECTORY",
+            media_cfg.get("local_directory", cfg.media.local_directory),
+        ),
     )
 
     archive_cfg = configurable.get("storage", {}).get("archive", {})

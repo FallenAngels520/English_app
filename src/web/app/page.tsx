@@ -1,7 +1,19 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, Loader2, RefreshCcw, RotateCcw, StopCircle } from 'lucide-react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  Loader2,
+  Maximize2,
+  RefreshCcw,
+  RotateCcw,
+  StopCircle,
+  X,
+  XCircle
+} from 'lucide-react';
 import { Sidebar } from '@/components/chat/sidebar';
 import { ChatInput } from '@/components/chat/chat-input';
 import { ChatMessage } from '@/components/chat/chat-message';
@@ -19,6 +31,7 @@ import type { WordMemoryResult } from '@/types/result';
 const STORAGE_KEY = 'english-app-chat-sessions';
 const ACTIVE_KEY = 'english-app-chat-active';
 const STORAGE_API_BASE = (process.env.NEXT_PUBLIC_AGENT_API_BASE_URL ?? 'http://127.0.0.1:8000').replace(/\/$/, '');
+const DEFAULT_SESSION_TITLE = '新会话';
 
 const buildStorageUrl = (path: string) => `${STORAGE_API_BASE}/storage${path}`;
 
@@ -33,7 +46,7 @@ const createConversation = (): Conversation => {
   const now = new Date().toISOString();
   return {
     id: generateId(),
-    title: '新会话',
+    title: DEFAULT_SESSION_TITLE,
     createdAt: now,
     updatedAt: now,
     messages: [],
@@ -79,9 +92,9 @@ const createMessage = (role: ChatMessageType['role'], content = ''): ChatMessage
 
 const buildTitleFromMessages = (messages: ChatMessageType[]) => {
   const firstUser = messages.find((message) => message.role === 'user');
-  if (!firstUser) return '新会话';
+  if (!firstUser) return DEFAULT_SESSION_TITLE;
   const normalized = firstUser.content.replace(/\s+/g, ' ').trim();
-  return normalized.length > 24 ? `${normalized.slice(0, 24)}…` : normalized || '新会话';
+  return normalized.length > 24 ? `${normalized.slice(0, 24)}…` : normalized || DEFAULT_SESSION_TITLE;
 };
 
 const buildFallbackImage = (word: string) => {
@@ -104,6 +117,13 @@ interface AgentResponse {
   final_output?: WordMemoryResult | null;
 }
 
+type RegenStatus = 'idle' | 'loading' | 'success' | 'error';
+
+interface ImagePreviewState {
+  src: string;
+  alt: string;
+}
+
 export default function ChatPage() {
   const [sessions, setSessions] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -119,8 +139,29 @@ export default function ChatPage() {
   const [detailVisible, setDetailVisible] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [regenStatus, setRegenStatus] = useState<RegenStatus>('idle');
+  const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const chatContainerRef = useRef<HTMLDivElement | null>(null);
+  const regenResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearRegenStatus = useCallback(() => {
+    if (regenResetRef.current) {
+      clearTimeout(regenResetRef.current);
+      regenResetRef.current = null;
+    }
+    setRegenStatus('idle');
+  }, []);
+
+  const scheduleRegenStatusReset = useCallback(() => {
+    if (regenResetRef.current) {
+      clearTimeout(regenResetRef.current);
+    }
+    regenResetRef.current = setTimeout(() => {
+      setRegenStatus('idle');
+      regenResetRef.current = null;
+    }, 2500);
+  }, []);
 
   const activeSession = useMemo(() => sessions.find((session) => session.id === activeId) ?? null, [sessions, activeId]);
   const libraryItems = useMemo(() => {
@@ -140,6 +181,15 @@ export default function ChatPage() {
         return bTime - aTime;
       });
   }, [sessions]);
+
+  useEffect(
+    () => () => {
+      if (regenResetRef.current) {
+        clearTimeout(regenResetRef.current);
+      }
+    },
+    []
+  );
 
   useEffect(() => {
     if (!showLibrary) return;
@@ -182,7 +232,7 @@ export default function ChatPage() {
         if (!response.ok) {
           throw new Error('无法加载卡片详情');
         }
-        const detail = (await response.json()) as CachedResponseRecord;
+    const detail = (await response.json()) as CachedResponseRecord;
         const result = detail.response?.final_output;
         if (result) {
           setDetailResult(result);
@@ -204,6 +254,24 @@ export default function ChatPage() {
     setDetailResult(null);
     setDetailError(null);
   };
+
+  const handlePreviewImage = useCallback((src: string | null | undefined, alt?: string) => {
+    if (!src) return;
+    setImagePreview({ src, alt: alt?.trim() || '图片预览' });
+  }, []);
+
+  const handleClosePreview = useCallback(() => setImagePreview(null), []);
+
+  useEffect(() => {
+    if (!imagePreview) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        handleClosePreview();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleClosePreview, imagePreview]);
 
   useEffect(() => {
     if (initialized) return;
@@ -306,11 +374,16 @@ export default function ChatPage() {
 
     fetchAllStoredResults();
   }, []);
-  useEffect(() => {
+  const scrollToBottom = useCallback(() => {
     const container = chatContainerRef.current;
     if (!container) return;
     container.scrollTop = container.scrollHeight;
-  }, [activeSession?.messages.length, isStreaming]);
+  }, []);
+
+  useEffect(() => {
+    const raf = requestAnimationFrame(scrollToBottom);
+    return () => cancelAnimationFrame(raf);
+  }, [scrollToBottom, activeSession?.id, activeSession?.messages.length, isStreaming, streamingMessageId]);
 
   const ensureSession = useCallback(() => {
     if (activeSession) return activeSession;
@@ -327,7 +400,10 @@ export default function ChatPage() {
         const nextMessages = typeof updater === 'function' ? (updater as (messages: ChatMessageType[]) => ChatMessageType[])(session.messages) : updater;
         return {
           ...session,
-          title: session.messages.length === 0 || session.title === '新会话' ? buildTitleFromMessages(nextMessages) : session.title,
+          title:
+            session.messages.length === 0 || session.title === DEFAULT_SESSION_TITLE
+              ? buildTitleFromMessages(nextMessages)
+              : session.title,
           messages: nextMessages,
           updatedAt: new Date().toISOString()
         };
@@ -341,6 +417,7 @@ export default function ChatPage() {
       const controller = new AbortController();
       abortControllerRef.current = controller;
       setError(null);
+      let isSuccess = false;
       try {
         const response = await fetch('/api/chat', {
           method: 'POST',
@@ -388,6 +465,7 @@ export default function ChatPage() {
           })
         );
         setPendingUserMessage(null);
+        isSuccess = true;
       } catch (chatError) {
         if ((chatError as DOMException).name === 'AbortError') {
           setError('生成已停止');
@@ -403,6 +481,7 @@ export default function ChatPage() {
         abortControllerRef.current = null;
         setStreamingMessageId(null);
       }
+      return isSuccess;
     },
     [updateSessionMessages]
   );
@@ -413,6 +492,7 @@ export default function ChatPage() {
       const sessionId = session.id;
       const text = (rawInput ?? input).trim();
       if (!text) return;
+      clearRegenStatus();
 
       const userMessage = createMessage('user', text);
       const assistantMessage = createMessage('assistant', '');
@@ -423,7 +503,7 @@ export default function ChatPage() {
       updateSessionMessages(sessionId, nextMessages);
       await runChat([...session.messages, userMessage], sessionId, assistantMessage.id);
     },
-    [ensureSession, input, runChat, updateSessionMessages]
+    [clearRegenStatus, ensureSession, input, runChat, updateSessionMessages]
   );
 
   const replayLastUserMessage = useCallback(async () => {
@@ -438,18 +518,30 @@ export default function ChatPage() {
     setPendingUserMessage(payload[payload.length - 1].content);
     setStreamingMessageId(assistantMessage.id);
     updateSessionMessages(activeSession.id, updatedMessages);
-    await runChat(payload, activeSession.id, assistantMessage.id);
-  }, [activeSession, runChat, updateSessionMessages]);
+    if (regenResetRef.current) {
+      clearTimeout(regenResetRef.current);
+      regenResetRef.current = null;
+    }
+    setRegenStatus('loading');
+    const ok = await runChat(payload, activeSession.id, assistantMessage.id);
+    setRegenStatus(ok ? 'success' : 'error');
+    scheduleRegenStatusReset();
+  }, [activeSession, runChat, scheduleRegenStatusReset, updateSessionMessages]);
 
   const handleStop = () => {
     if (!abortControllerRef.current) return;
     abortControllerRef.current.abort();
+    if (regenStatus === 'loading') {
+      setRegenStatus('error');
+      scheduleRegenStatusReset();
+    }
   };
 
   const handleDeleteSession = (sessionId: string) => {
     setError(null);
     setPendingUserMessage(null);
     setStreamingMessageId(null);
+    clearRegenStatus();
     if (abortControllerRef.current && activeId === sessionId) {
       abortControllerRef.current.abort();
     }
@@ -478,6 +570,7 @@ export default function ChatPage() {
     setError(null);
     setPendingUserMessage(null);
     setStreamingMessageId(null);
+    clearRegenStatus();
   };
 
   const lastUserMessage = useMemo(() => {
@@ -489,7 +582,7 @@ export default function ChatPage() {
 
   if (!initialized) {
     return (
-      <main className="flex h-screen items-center justify-center bg-background">
+      <main className="flex min-h-screen items-center justify-center bg-background">
         <div className="flex flex-col items-center gap-3 text-muted-foreground">
           <Loader2 className="h-6 w-6 animate-spin" />
           <p>加载中…</p>
@@ -500,106 +593,164 @@ export default function ChatPage() {
 
   return (
     <>
-    <main className="flex h-screen bg-background text-foreground">
-      <Sidebar
-        sessions={sessions}
-        activeId={activeId}
-        onSelect={setActiveId}
-        onCreate={handleCreateSession}
-        onDelete={handleDeleteSession}
-        onOpenLibrary={handleOpenLibrary}
-        hasLibraryItems={libraryItems.length > 0}
-      />
-      <section className="flex flex-1 flex-col">
-        <header className="flex items-center justify-between border-b px-6 py-4">
-          <div>
-            <h1 className="text-lg font-semibold">English 助手</h1>
-            <p className="text-sm text-muted-foreground">支持 Markdown、代码高亮与流式回复</p>
-          </div>
-          <div className="flex gap-2">
-            {isStreaming ? (
-              <Button variant="destructive" onClick={handleStop} size="sm" className="gap-2">
-                <StopCircle className="h-4 w-4" /> 停止生成
-              </Button>
-            ) : (
-              <Button variant="secondary" onClick={replayLastUserMessage} size="sm" disabled={!lastUserMessage} className="gap-2">
-                <RotateCcw className="h-4 w-4" /> 重新生成
-              </Button>
-            )}
-          </div>
-        </header>
-        <div ref={chatContainerRef} className="chat-scroll flex-1 overflow-y-auto px-6 py-6">
-          {!activeSession || activeSession.messages.length === 0 ? (
-            <div className="flex h-full flex-col items-center justify-center text-center text-muted-foreground">
-              <RefreshCcw className="mb-4 h-10 w-10" />
-              <p className="text-lg font-semibold">开始新的对话</p>
-              <p className="text-sm">输入你的问题，按 Enter 即可发送。Shift+Enter 用于换行。</p>
+      <main className="flex min-h-screen bg-background text-foreground">
+        <Sidebar
+          sessions={sessions}
+          activeId={activeId}
+          onSelect={setActiveId}
+          onCreate={handleCreateSession}
+          onDelete={handleDeleteSession}
+          onOpenLibrary={handleOpenLibrary}
+          hasLibraryItems={libraryItems.length > 0}
+        />
+        <section className="flex min-w-0 flex-1 flex-col">
+          <header className="flex flex-wrap items-center justify-between gap-4 border-b px-6 py-4">
+            <div className="space-y-1">
+              <p className="text-xs uppercase tracking-[0.3em] text-muted-foreground">English Helper</p>
+              <h1 className="text-2xl font-semibold leading-tight">English 助手</h1>
+              <p className="text-sm text-muted-foreground">支持 Markdown、代码高亮与流式回复</p>
             </div>
-          ) : (
-            <div className="flex flex-col gap-4">
-              {activeSession.messages.map((message) => (
-                <ChatMessage key={message.id} message={message} isStreaming={streamingMessageId === message.id && isStreaming} />
-              ))}
+            <div className="flex flex-col items-end gap-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="secondary"
+                  onClick={replayLastUserMessage}
+                  size="sm"
+                  className="gap-2"
+                  disabled={!lastUserMessage || regenStatus === 'loading' || isStreaming}
+                  type="button"
+                >
+                  {regenStatus === 'loading' ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+                  {regenStatus === 'loading' ? '生成中…' : '重新生成'}
+                </Button>
+                {isStreaming && (
+                  <Button variant="destructive" onClick={handleStop} size="sm" className="gap-2" type="button">
+                    <StopCircle className="h-4 w-4" /> 停止生成
+                  </Button>
+                )}
+              </div>
+              {regenStatus !== 'idle' && (
+                <div
+                  className={`flex items-center gap-1 text-xs ${
+                    regenStatus === 'success'
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : regenStatus === 'error'
+                      ? 'text-destructive'
+                      : 'text-muted-foreground'
+                  }`}
+                >
+                  {regenStatus === 'success' && <CheckCircle2 className="h-3.5 w-3.5" />}
+                  {regenStatus === 'error' && <XCircle className="h-3.5 w-3.5" />}
+                  {regenStatus === 'loading' && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  <span>
+                    {regenStatus === 'success'
+                      ? '最新回复已生成'
+                      : regenStatus === 'error'
+                      ? '生成失败，请重试'
+                      : '正在生成回复…'}
+                  </span>
+                </div>
+              )}
+            </div>
+          </header>
+          <div ref={chatContainerRef} className="chat-scroll flex flex-1 flex-col overflow-y-auto px-4 py-6">
+            <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col">
+              {!activeSession || activeSession.messages.length === 0 ? (
+                <div className="flex flex-1 flex-col items-center justify-center rounded-3xl border border-dashed border-border/70 bg-card/60 px-6 py-10 text-center text-muted-foreground">
+                  <RefreshCcw className="mb-4 h-10 w-10 text-primary" />
+                  <p className="text-lg font-semibold text-foreground">开始新的对话</p>
+                  <p className="text-sm leading-relaxed">
+                    输入你的问题，按 Enter 即可发送。<br />
+                    Shift+Enter 用于换行。
+                  </p>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-4 pb-4">
+                  {activeSession.messages.map((message) => (
+                    <ChatMessage key={message.id} message={message} isStreaming={streamingMessageId === message.id && isStreaming} />
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+          {error && (
+            <div className="border-t bg-destructive/5 px-4 py-4">
+              <div className="mx-auto w-full max-w-3xl">
+                <Alert variant="destructive" className="bg-transparent">
+                  <AlertTriangle className="h-4 w-4" />
+                  <AlertTitle>出错了</AlertTitle>
+                  <AlertDescription className="flex flex-wrap items-center gap-3 text-sm">
+                    <span>{error}</span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={replayLastUserMessage}
+                      className="gap-2"
+                      disabled={isStreaming || regenStatus === 'loading'}
+                      type="button"
+                    >
+                      <RefreshCcw className="h-4 w-4" /> 重试
+                    </Button>
+                  </AlertDescription>
+                </Alert>
+              </div>
             </div>
           )}
-        </div>
-        {error && (
-          <div className="border-t bg-destructive/10 px-6 py-4">
-            <Alert variant="destructive" className="bg-transparent">
-              <AlertTriangle className="h-4 w-4" />
-              <AlertTitle>出错了</AlertTitle>
-              <AlertDescription className="flex flex-wrap items-center gap-3">
-                <span>{error}</span>
-                <Button size="sm" variant="outline" onClick={replayLastUserMessage} className="gap-2">
-                  <RefreshCcw className="h-4 w-4" /> 重试
-                </Button>
-              </AlertDescription>
-            </Alert>
-          </div>
-        )}
-        {finalOutputs.length > 0 && (
-          <div className="border-t bg-muted/20 px-6 py-4">
-            <div className="space-y-4">
-              {finalOutputs.map((entry) => (
-                <ResultPanel key={entry.id} result={entry.result} />
-              ))}
+          {finalOutputs.length > 0 && (
+            <div className="border-t bg-muted/20 px-4 py-4">
+              <div className="mx-auto w-full max-w-3xl space-y-4">
+                {finalOutputs.map((entry) => (
+                  <ResultPanel key={entry.id} result={entry.result} onPreviewImage={handlePreviewImage} />
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="border-t bg-card/70 px-4 py-4">
+            <div className="mx-auto w-full max-w-3xl space-y-2">
+              <ChatInput
+                value={input}
+                onChange={setInput}
+                placeholder="和 English 助手聊天..."
+                disabled={isStreaming}
+                isLoading={isStreaming}
+                onSubmit={() => sendNewMessage()}
+              />
+              <div className="flex flex-wrap items-center justify-between text-xs text-muted-foreground">
+                <span>Enter 发送 · Shift+Enter 换行</span>
+                {pendingUserMessage && !isStreaming && (
+                  <Button
+                    variant="link"
+                    size="sm"
+                    onClick={replayLastUserMessage}
+                    className="p-0 text-xs"
+                    disabled={regenStatus === 'loading'}
+                    type="button"
+                  >
+                    再试一次
+                  </Button>
+                )}
+              </div>
             </div>
           </div>
-        )}
-        <div className="border-t bg-card/70 px-6 py-4">
-          <ChatInput
-            value={input}
-            onChange={setInput}
-            placeholder="和 English 助手聊天..."
-            disabled={isStreaming}
-            onSubmit={() => sendNewMessage()}
-          />
-          <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
-            <span>Enter 发送 · Shift+Enter 换行</span>
-            {pendingUserMessage && !isStreaming && (
-              <Button variant="link" size="sm" onClick={replayLastUserMessage} className="p-0 text-xs">
-                再试一次
-              </Button>
-            )}
-          </div>
-        </div>
-      </section>
-    </main>
-    {showLibrary && (
-      <CardLibraryOverlay
-        items={libraryItems}
-        index={libraryIndex}
-        onClose={handleCloseLibrary}
-        onPrev={handlePrevLibrary}
-        onNext={handleNextLibrary}
-        onViewDetail={handleViewDetail}
-        detailLoading={detailLoading}
-        detailError={detailError}
-      />
-    )}
-    {detailVisible && detailResult && (
-      <CardDetailModal result={detailResult} onClose={handleCloseDetail} />
-    )}
+        </section>
+      </main>
+      {showLibrary && (
+        <CardLibraryOverlay
+          items={libraryItems}
+          index={libraryIndex}
+          onClose={handleCloseLibrary}
+          onPrev={handlePrevLibrary}
+          onNext={handleNextLibrary}
+          onViewDetail={handleViewDetail}
+          onPreviewImage={handlePreviewImage}
+          detailLoading={detailLoading}
+          detailError={detailError}
+        />
+      )}
+      {detailVisible && detailResult && (
+        <CardDetailModal result={detailResult} onClose={handleCloseDetail} onPreviewImage={handlePreviewImage} />
+      )}
+      {imagePreview && <ImagePreviewModal image={imagePreview} onClose={handleClosePreview} />}
     </>
   );
 }
@@ -619,6 +770,7 @@ interface CardLibraryOverlayProps {
   onPrev: () => void;
   onNext: () => void;
   onViewDetail: (item: LibraryItem) => void;
+  onPreviewImage: (src: string | null | undefined, alt?: string) => void;
   detailLoading: boolean;
   detailError: string | null;
 }
@@ -630,6 +782,7 @@ function CardLibraryOverlay({
   onPrev,
   onNext,
   onViewDetail,
+  onPreviewImage,
   detailLoading,
   detailError
 }: CardLibraryOverlayProps) {
@@ -638,70 +791,90 @@ function CardLibraryOverlay({
   const hasNext = index < items.length - 1;
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-background/85 backdrop-blur">
-      <div className="flex items-center justify-between border-b px-6 py-4">
+    <div className="fixed inset-0 z-50 flex flex-col bg-background/90 backdrop-blur">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b px-6 py-4">
         <div>
           <h2 className="text-lg font-semibold">卡片库</h2>
-          <p className="text-sm text-muted-foreground">向左滑动浏览全部卡片，向右滑动查看下一张。（共 {items.length} 张）</p>
+          <p className="text-sm text-muted-foreground">共 {items.length} 张记忆卡片，点击卡片名称可查看详情。</p>
         </div>
-        <Button variant="ghost" onClick={onClose}>
-          关闭
+        <Button variant="ghost" onClick={onClose} className="gap-2" type="button">
+          <X className="h-4 w-4" /> 关闭
         </Button>
       </div>
-      <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 py-6">
+      <div className="flex flex-1 flex-col px-4 py-6">
         {current ? (
-          <>
-              <div className="relative flex w-full max-w-3xl items-center justify-center">
+          <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-6">
+            <div className="flex flex-1 flex-col gap-6 rounded-3xl border bg-card/80 p-6 shadow-2xl">
+              <div className="flex flex-col items-center gap-3 text-center">
                 <button
                   type="button"
-                  className="absolute -left-20 flex h-12 w-12 items-center justify-center rounded-full bg-background/80 text-lg text-primary shadow-md ring-1 ring-border disabled:opacity-30"
-                  onClick={onPrev}
-                  disabled={!hasPrev}
-                  aria-label="上一张"
+                  className="text-4xl font-bold text-foreground transition hover:text-primary"
+                  onClick={() => onViewDetail(current)}
                 >
-                  ←
+                  {current.result.word_block?.word ?? '未命名'}
                 </button>
-                <div className="flex flex-1 flex-col items-center gap-5 rounded-3xl border bg-card/70 p-6 shadow-2xl">
-                  <button
-                    type="button"
-                    className="text-4xl font-bold text-center text-foreground hover:text-primary"
-                    onClick={() => onViewDetail(current)}
-                  >
-                    {current.result.word_block?.word ?? '未命名'}
-                  </button>
-                  {detailLoading && <p className="text-xs text-muted-foreground">正在加载完整信息…</p>}
-                  {detailError && <p className="text-xs text-destructive">{detailError}</p>}
-                  <div className="w-full max-w-lg rounded-2xl border bg-background p-4">
+                {detailLoading && <p className="text-xs text-muted-foreground">正在加载完整信息…</p>}
+                {detailError && <p className="text-xs text-destructive">{detailError}</p>}
+              </div>
+              <div className="grid gap-6 md:grid-cols-2">
+                <div className="space-y-4">
+                  <div className="relative aspect-[5/3] w-full overflow-hidden rounded-2xl border border-border bg-background">
                     <img
                       src={getCardImageUrl(current.result)}
                       alt={current.result.word_block?.word ?? 'card image'}
-                      className="w-full rounded-xl"
+                      className="h-full w-full object-cover"
+                      loading="lazy"
                     />
+                    <button
+                      type="button"
+                      className="absolute right-3 top-3 inline-flex items-center gap-1 rounded-full bg-background/80 px-3 py-1 text-xs font-medium text-foreground shadow ring-1 ring-border backdrop-blur"
+                      onClick={() => onPreviewImage(getCardImageUrl(current.result), current.result.word_block?.word)}
+                    >
+                      <Maximize2 className="h-3.5 w-3.5" /> 放大查看
+                    </button>
+                  </div>
+                  <div className="rounded-2xl bg-muted/40 p-4 text-sm leading-relaxed text-muted-foreground">
+                    <p>生成时间：{current.createdAt ? new Date(current.createdAt).toLocaleString() : '未知'}</p>
+                    <p>记录 ID：{current.recordId ?? '暂无'}</p>
+                  </div>
                 </div>
-                <div className="text-center">
-                  <p className="text-sm text-muted-foreground">词义</p>
-                  <p className="text-xl font-semibold">
-                    {current.result.word_block?.meaning.pos && (
-                      <span className="mr-2 text-muted-foreground">{current.result.word_block.meaning.pos}</span>
-                    )}
-                    {current.result.word_block?.meaning.cn ?? '暂无释义'}
-                  </p>
+                <div className="space-y-4 rounded-2xl border border-border/60 bg-background/80 p-5">
+                  <div>
+                    <p className="text-xs font-semibold tracking-[0.2em] text-muted-foreground">词义</p>
+                    <p className="text-xl font-semibold">
+                      {current.result.word_block?.meaning.pos && (
+                        <span className="mr-2 text-muted-foreground">{current.result.word_block.meaning.pos}</span>
+                      )}
+                      {current.result.word_block?.meaning.cn ?? '暂无释义'}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs font-semibold tracking-[0.2em] text-muted-foreground">记忆提示</p>
+                    <p className="text-sm leading-relaxed text-muted-foreground">
+                      {current.result.word_block?.story ?? '暂无记忆场景'}
+                    </p>
+                  </div>
                 </div>
               </div>
-              <button
-                type="button"
-                className="absolute -right-20 flex h-12 w-12 items-center justify-center rounded-full bg-background/80 text-lg text-primary shadow-md ring-1 ring-border disabled:opacity-30"
-                onClick={onNext}
-                disabled={!hasNext}
-                aria-label="下一张"
-              >
-                →
-              </button>
             </div>
-            <p className="text-xs text-muted-foreground">滑动或使用箭头切换卡片。</p>
-          </>
+            <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-muted-foreground">
+              <span>
+                第 {index + 1} / {items.length} 张
+              </span>
+              <div className="flex items-center gap-3">
+                <Button variant="outline" size="sm" onClick={onPrev} disabled={!hasPrev} className="gap-1">
+                  <ChevronLeft className="h-4 w-4" /> 上一张
+                </Button>
+                <Button variant="outline" size="sm" onClick={onNext} disabled={!hasNext} className="gap-1">
+                  下一张 <ChevronRight className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          </div>
         ) : (
-          <p className="text-sm text-muted-foreground">暂无卡片可展示。</p>
+          <div className="flex flex-1 flex-col items-center justify-center text-sm text-muted-foreground">
+            暂无卡片可展示。
+          </div>
         )}
       </div>
     </div>
@@ -711,23 +884,62 @@ function CardLibraryOverlay({
 interface CardDetailModalProps {
   result: WordMemoryResult;
   onClose: () => void;
+  onPreviewImage: (src: string | null | undefined, alt?: string) => void;
 }
 
-function CardDetailModal({ result, onClose }: CardDetailModalProps) {
+function CardDetailModal({ result, onClose, onPreviewImage }: CardDetailModalProps) {
   if (!result) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/90 p-4">
       <div className="relative w-full max-w-4xl max-h-[90vh] overflow-y-auto rounded-3xl border bg-card p-6 shadow-2xl">
         <div className="flex items-center justify-between border-b pb-3">
-          <h3 className="text-lg font-semibold">å¡ç‰‡è¯¦æƒ…</h3>
-          <Button variant="ghost" onClick={onClose}>
-            å…³é—­
+          <h3 className="text-lg font-semibold">????</h3>
+          <Button variant="ghost" onClick={onClose} className="gap-2" type="button">
+            <X className="h-4 w-4" /> ??
           </Button>
         </div>
         <div className="mt-4">
-          <ResultPanel result={result} />
+          <ResultPanel result={result} onPreviewImage={onPreviewImage} />
         </div>
+      </div>
+    </div>
+  );
+}
+
+interface ImagePreviewModalProps {
+  image: ImagePreviewState;
+  onClose: () => void;
+}
+
+function ImagePreviewModal({ image, onClose }: ImagePreviewModalProps) {
+  useEffect(() => {
+    const originalOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = originalOverflow;
+    };
+  }, []);
+
+  const altText = image.alt || '图片预览';
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+    >
+      <div className="relative w-full max-w-4xl" onClick={(event) => event.stopPropagation()}>
+        <button
+          type="button"
+          className="absolute right-4 top-4 inline-flex items-center gap-2 rounded-full bg-white/80 px-4 py-2 text-sm font-medium text-foreground shadow ring-1 ring-border"
+          onClick={onClose}
+        >
+          <X className="h-4 w-4" /> 关闭
+        </button>
+        <img src={image.src} alt={altText} className="max-h-[80vh] w-full rounded-3xl object-contain shadow-2xl" />
+        {altText && <p className="mt-3 text-center text-sm text-white/80">{altText}</p>}
       </div>
     </div>
   );

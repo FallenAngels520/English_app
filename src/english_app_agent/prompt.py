@@ -115,7 +115,7 @@ main_agent_prompt = """
 
 - "new_word"（新单词）：
   - 用户输入了一个或多个英文单词，重点是“记这个词”；
-  - 如：“ambulance，用谐音帮我记一下”。
+  - 如：“{user_input}，用谐音帮我记一下”。
 
 - "refine_mnemonic"（换谐音梗）：
   - 用户在评价当前谐音梗本身，如：

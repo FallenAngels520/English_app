@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from __future__ import annotations
-
 import asyncio
 import json
 import logging
@@ -154,31 +152,44 @@ class StorageManager:
         self,
         final_output: Optional[WordMemoryResult],
         media_config: MediaStorageConfig,
+        session_id: Optional[str] = None,
     ) -> Optional[WordMemoryResult]:
-        if not final_output or not media_config.enable or media_config.provider != "aliyun_oss":
-            return final_output
-        try:
-            client = self._get_media_storage(media_config)
-        except Exception as exc:
-            logger.warning("Media storage unavailable: %s", exc)
+        if not final_output or not media_config.enable or media_config.provider == "none":
             return final_output
 
-        updated = final_output.model_copy(deep=True)
-        media = updated.media
-        if not media:
+        if media_config.provider == "aliyun_oss":
+            try:
+                client = self._get_media_storage(media_config)
+            except Exception as exc:
+                logger.warning("Media storage unavailable: %s", exc)
+                return final_output
+
+            updated = final_output.model_copy(deep=True)
+            media = updated.media
+            if not media:
+                return updated
+
+            if media.image and media.image.url:
+                new_url = await asyncio.to_thread(client.upload_from_url, media.image.url, "images")
+                if new_url:
+                    media.image.url = new_url
+
+            if media.audio and media.audio.url:
+                new_url = await asyncio.to_thread(client.upload_from_url, media.audio.url, "audio")
+                if new_url:
+                    media.audio.url = new_url
+
             return updated
 
-        if media.image and media.image.url:
-            new_url = await asyncio.to_thread(client.upload_from_url, media.image.url, "images")
-            if new_url:
-                media.image.url = new_url
+        if media_config.provider == "local_fs":
+            return await asyncio.to_thread(
+                self._cache_media_locally,
+                final_output,
+                media_config,
+                session_id,
+            )
 
-        if media.audio and media.audio.url:
-            new_url = await asyncio.to_thread(client.upload_from_url, media.audio.url, "audio")
-            if new_url:
-                media.audio.url = new_url
-
-        return updated
+        return final_output
 
     async def persist_response(
         self,
@@ -237,6 +248,84 @@ class StorageManager:
         if key not in self._archive_instances:
             self._archive_instances[key] = AliyunOSSStorage(config)
         return self._archive_instances[key]
+
+    def _cache_media_locally(
+        self,
+        final_output: WordMemoryResult,
+        media_config: MediaStorageConfig,
+        session_id: Optional[str],
+    ) -> WordMemoryResult:
+        updated = final_output.model_copy(deep=True)
+        media = updated.media
+        if not media:
+            return updated
+
+        safe_session = self.sanitize_storage_key(session_id or "session")
+        base_dir = Path(media_config.local_directory).expanduser()
+        target_dir = base_dir / safe_session
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        if media.image and media.image.url:
+            new_url = self._download_media_to_local(media.image.url, target_dir, "image", safe_session)
+            if new_url:
+                media.image.url = new_url
+
+        if media.audio and media.audio.url:
+            new_url = self._download_media_to_local(media.audio.url, target_dir, "audio", safe_session)
+            if new_url:
+                media.audio.url = new_url
+
+        return updated
+
+    def _download_media_to_local(
+        self,
+        source_url: str,
+        target_dir: Path,
+        prefix: str,
+        session_folder: str,
+    ) -> Optional[str]:
+        parsed = urlparse(source_url)
+        if not parsed.scheme and source_url.startswith("/media/"):
+            return source_url
+
+        if parsed.scheme in {"file"}:
+            source_path = Path(parsed.path)
+            if not source_path.exists():
+                return None
+            suffix = source_path.suffix or ".bin"
+            file_name = f"{prefix}-{uuid.uuid4().hex}{suffix}"
+            dest_path = target_dir / file_name
+            try:
+                dest_path.write_bytes(source_path.read_bytes())
+            except OSError as exc:
+                logger.warning("Failed to copy local media %s: %s", source_url, exc)
+                return None
+            return f"/media/{session_folder}/{file_name}"
+
+        if parsed.scheme not in {"http", "https"}:
+            return source_url
+
+        try:
+            with urllib.request.urlopen(source_url, timeout=30) as response:
+                data = response.read()
+        except Exception as exc:
+            logger.warning("Failed to download media [%s]: %s", source_url, exc)
+            return None
+
+        suffix = Path(parsed.path).suffix or ".bin"
+        file_name = f"{prefix}-{uuid.uuid4().hex}{suffix}"
+        dest_path = target_dir / file_name
+        try:
+            dest_path.write_bytes(data)
+        except OSError as exc:
+            logger.warning("Failed to save media locally (%s): %s", dest_path, exc)
+            return None
+        return f"/media/{session_folder}/{file_name}"
+
+    @staticmethod
+    def sanitize_storage_key(value: str) -> str:
+        sanitized = "".join(ch for ch in value if ch.isalnum() or ch in {"-", "_"})
+        return sanitized or "session"
 
     @staticmethod
     def _to_dict(payload: Any) -> Dict[str, Any]:

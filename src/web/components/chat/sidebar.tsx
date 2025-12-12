@@ -18,13 +18,13 @@ interface SidebarProps {
 
 export function Sidebar({ sessions, activeId, onSelect, onCreate, onDelete, onOpenLibrary, hasLibraryItems }: SidebarProps) {
   return (
-    <aside className="flex h-full w-64 flex-shrink-0 flex-col border-r bg-card">
-      <div className="flex items-center justify-between border-b px-4 py-3">
+    <aside className="flex h-full w-72 flex-shrink-0 flex-col border-r border-border/80 bg-card/95 backdrop-blur">
+      <div className="border-b px-4 py-3">
         <Button onClick={onCreate} className="w-full gap-2" variant="default">
           <Plus className="h-4 w-4" /> 新会话
         </Button>
       </div>
-      <div className="border-b px-4 pb-3">
+      <div className="border-b px-4 pb-3 pt-3">
         <Button
           onClick={onOpenLibrary}
           className="w-full gap-2"
@@ -34,39 +34,54 @@ export function Sidebar({ sessions, activeId, onSelect, onCreate, onDelete, onOp
           <BookOpen className="h-4 w-4" /> 卡片库
         </Button>
       </div>
-      <div className="flex-1 overflow-y-auto p-2 chat-scroll">
+      <div className="chat-scroll flex-1 overflow-y-auto p-3">
         {sessions.length === 0 ? (
-          <p className="p-4 text-sm text-muted-foreground">还没有会话，点击“新会话”开始聊天。</p>
+          <p className="rounded-xl border border-dashed border-border/70 bg-card/70 p-4 text-sm text-muted-foreground">
+            还没有会话，点击「新会话」开始聊天。
+          </p>
         ) : (
-          <ul className="space-y-1">
-            {sessions.map((session) => (
-              <li key={session.id}>
-                <div
-                  className={cn(
-                    'group flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm transition hover:bg-accent',
-                    activeId === session.id ? 'bg-accent text-accent-foreground' : 'text-muted-foreground'
-                  )}
-                >
-                  <button
-                    type="button"
-                    className="flex flex-1 items-center gap-2 text-left"
-                    onClick={() => onSelect(session.id)}
+          <ul className="space-y-1.5">
+            {sessions.map((session) => {
+              const isActive = activeId === session.id;
+              const title = session.title || '未命名会话';
+              return (
+                <li key={session.id}>
+                  <div
+                    className={cn(
+                      'group flex items-center justify-between rounded-xl border px-3 py-2 text-sm transition-all',
+                      isActive
+                        ? 'border-primary/40 bg-primary/10 text-foreground shadow-sm'
+                        : 'border-transparent text-muted-foreground hover:border-border/80 hover:bg-muted/40'
+                    )}
                   >
-                    <MessageSquare className="h-4 w-4" />
-                    <span className="line-clamp-1">{session.title || '未命名会话'}</span>
-                  </button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="invisible text-muted-foreground hover:text-destructive group-hover:visible"
-                    onClick={() => onDelete(session.id)}
-                    aria-label="删除会话"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
-              </li>
-            ))}
+                    <button
+                      type="button"
+                      className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                      onClick={() => onSelect(session.id)}
+                      aria-current={isActive}
+                      title={title}
+                    >
+                      <MessageSquare
+                        className={cn('h-4 w-4 flex-shrink-0', isActive ? 'text-primary' : 'text-muted-foreground')}
+                      />
+                      <span className="truncate font-medium">{title}</span>
+                    </button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className={cn(
+                        'text-muted-foreground transition group-hover:opacity-100 focus-visible:opacity-100',
+                        isActive ? 'opacity-100' : 'opacity-0'
+                      )}
+                      onClick={() => onDelete(session.id)}
+                      aria-label="删除会话"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>
