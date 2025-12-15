@@ -778,12 +778,3 @@ config = {"configurable": {"thread_id": "english_app_agent_thread"}}
 checkpointer = InMemorySaver()
 
 app_agent = english_app_agent_graph.compile(checkpointer=checkpointer)
-
-async def run_agent():
-    input_data = {
-        "messages": [HumanMessage(content="帮我解释这个单词 'dependency' 并生成一个有趣的记忆方法。")],
-    }
-    result = await app_agent.ainvoke(input_data, config=config)
-    print(result)
-
-asyncio.run(run_agent())

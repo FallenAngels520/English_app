@@ -1,9 +1,10 @@
 'use client';
 
+import Link from 'next/link';
 import { Conversation } from '@/types/chat';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
-import { Plus, MessageSquare, Trash2, BookOpen } from 'lucide-react';
+import { Plus, MessageSquare, Trash2, BookOpen, UserRound } from 'lucide-react';
 import { ThemeToggle } from '@/components/theme-toggle';
 
 interface SidebarProps {
@@ -14,11 +15,23 @@ interface SidebarProps {
   onDelete: (id: string) => void;
   onOpenLibrary: () => void;
   hasLibraryItems: boolean;
+  dashboardUrl: string;
 }
 
-export function Sidebar({ sessions, activeId, onSelect, onCreate, onDelete, onOpenLibrary, hasLibraryItems }: SidebarProps) {
+export function Sidebar({
+  sessions,
+  activeId,
+  onSelect,
+  onCreate,
+  onDelete,
+  onOpenLibrary,
+  hasLibraryItems,
+  dashboardUrl
+}: SidebarProps) {
+  const isExternalDashboard = /^https?:\/\//i.test(dashboardUrl);
+
   return (
-    <aside className="flex h-full w-72 flex-shrink-0 flex-col border-r border-border/80 bg-card/95 backdrop-blur">
+    <aside className="flex h-screen w-72 flex-shrink-0 flex-col border-r border-border/80 bg-card/95 backdrop-blur">
       <div className="border-b px-4 py-3">
         <Button onClick={onCreate} className="w-full gap-2" variant="default">
           <Plus className="h-4 w-4" /> 新会话
@@ -85,9 +98,22 @@ export function Sidebar({ sessions, activeId, onSelect, onCreate, onDelete, onOp
           </ul>
         )}
       </div>
-      <div className="flex items-center justify-between border-t px-4 py-3 text-sm text-muted-foreground">
-        <span>外观</span>
-        <ThemeToggle />
+      <div className="border-t px-4 py-3">
+        <div className="flex items-center justify-between text-sm text-muted-foreground">
+          <span>外观</span>
+          <ThemeToggle />
+        </div>
+        <Button variant="outline" className="mt-3 w-full gap-2" asChild>
+          {isExternalDashboard ? (
+            <a href={dashboardUrl} target="_blank" rel="noreferrer">
+              <UserRound className="h-4 w-4" /> 我的
+            </a>
+          ) : (
+            <Link href={dashboardUrl}>
+              <UserRound className="h-4 w-4" /> 我的
+            </Link>
+          )}
+        </Button>
       </div>
     </aside>
   );

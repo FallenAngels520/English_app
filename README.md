@@ -145,4 +145,20 @@ uv run python -m pytest
 - **API errors**: `/api/chat` surfaces backend exceptions via JSON `{ error: "..." }`. Check the FastAPI logs for stack traces.
 - **Missing keys**: The agent reads provider keys from env vars unless `GET_API_KEYS_FROM_CONFIG=true`, in which case pass them via `configurable.apiKeys`.
 
-With uv managing dependencies and FastAPI hosting the compiled LangGraph, the backend remains lightweight and easy to iterate alongside the Next.js frontend.***
+### Dashboard API
+
+When `backend.data_dashboard` is installed, the main FastAPI app automatically mounts it under `/dashboard`. Configure the repository connection via:
+
+```ini
+DATA_DASHBOARD_DATABASE_URL=postgresql+psycopg2://user:pass@host/dbname
+```
+
+If the env var is missing you can still POST inline telemetry by hitting `/dashboard/dashboard` with `events` and `memberships` arrays (see `src/backend/data_dashboard/README.md` for a template). Run the unified server as usual:
+
+```bash
+uv run uvicorn english_app_agent.server:app --app-dir src --reload --port 8000
+```
+
+The mounted sub-application also exposes `/dashboard/health`.
+
+With uv managing dependencies and FastAPI hosting both the LangGraph flow and dashboard routes, the backend remains lightweight and easy to iterate alongside the Next.js frontend.

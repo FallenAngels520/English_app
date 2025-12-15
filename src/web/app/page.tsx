@@ -30,10 +30,13 @@ import type { WordMemoryResult } from '@/types/result';
 
 const STORAGE_KEY = 'english-app-chat-sessions';
 const ACTIVE_KEY = 'english-app-chat-active';
-const STORAGE_API_BASE = (process.env.NEXT_PUBLIC_AGENT_API_BASE_URL ?? 'http://127.0.0.1:8000').replace(/\/$/, '');
+const API_BASE = (process.env.NEXT_PUBLIC_AGENT_API_BASE_URL ?? 'http://127.0.0.1:8000').replace(/\/$/, '');
+const STORAGE_API_BASE = `${API_BASE}/storage`;
+const rawDashboardUrl = process.env.NEXT_PUBLIC_DASHBOARD_URL ?? '/dashboard';
+const DASHBOARD_URL = rawDashboardUrl.startsWith('http') ? rawDashboardUrl.replace(/\/$/, '') : rawDashboardUrl;
 const DEFAULT_SESSION_TITLE = '新会话';
 
-const buildStorageUrl = (path: string) => `${STORAGE_API_BASE}/storage${path}`;
+const buildStorageUrl = (path: string) => `${STORAGE_API_BASE}${path}`;
 
 const generateId = () => {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -78,9 +81,19 @@ const normalizeConversation = (
   return {
     ...fallback,
     ...rest,
+    title: sanitizeTitle(rest.title, fallback.title),
     finalOutputs: normalizedOutputs,
     messages: session.messages ?? fallback.messages
   };
+};
+
+const sanitizeTitle = (title?: string, fallbackTitle = DEFAULT_SESSION_TITLE) => {
+  if (!title) return fallbackTitle;
+  const trimmed = title.trim();
+  if (!trimmed || trimmed === '???') {
+    return fallbackTitle;
+  }
+  return trimmed;
 };
 
 const createMessage = (role: ChatMessageType['role'], content = ''): ChatMessageType => ({
@@ -579,6 +592,13 @@ export default function ChatPage() {
   }, [activeSession]);
 
   const finalOutputs = activeSession?.finalOutputs ?? [];
+  const finalOutputMap = useMemo(() => {
+    const map: Record<string, WordMemoryResult> = {};
+    finalOutputs.forEach((entry) => {
+      map[entry.id] = entry.result;
+    });
+    return map;
+  }, [finalOutputs]);
 
   if (!initialized) {
     return (
@@ -593,7 +613,7 @@ export default function ChatPage() {
 
   return (
     <>
-      <main className="flex min-h-screen bg-background text-foreground">
+      <main className="flex h-screen overflow-hidden bg-background text-foreground">
         <Sidebar
           sessions={sessions}
           activeId={activeId}
@@ -602,8 +622,9 @@ export default function ChatPage() {
           onDelete={handleDeleteSession}
           onOpenLibrary={handleOpenLibrary}
           hasLibraryItems={libraryItems.length > 0}
+          dashboardUrl={DASHBOARD_URL}
         />
-        <section className="flex min-w-0 flex-1 flex-col">
+        <section className="flex min-w-0 flex-1 flex-col overflow-hidden">
           <header className="flex flex-wrap items-center justify-between gap-4 border-b px-6 py-4">
             <div className="space-y-1">
               <p className="text-xs uppercase tracking-[0.3em] text-muted-foreground">English Helper</p>
@@ -667,12 +688,18 @@ export default function ChatPage() {
               ) : (
                 <div className="flex flex-col gap-4 pb-4">
                   {activeSession.messages.map((message) => (
-                    <ChatMessage key={message.id} message={message} isStreaming={streamingMessageId === message.id && isStreaming} />
+                    <ChatMessage
+                      key={message.id}
+                      message={message}
+                      isStreaming={streamingMessageId === message.id && isStreaming}
+                      result={finalOutputMap[message.id]}
+                      onPreviewImage={handlePreviewImage}
+                    />
                   ))}
-                </div>
-              )}
-            </div>
+              </div>
+            )}
           </div>
+        </div>
           {error && (
             <div className="border-t bg-destructive/5 px-4 py-4">
               <div className="mx-auto w-full max-w-3xl">
@@ -693,15 +720,6 @@ export default function ChatPage() {
                     </Button>
                   </AlertDescription>
                 </Alert>
-              </div>
-            </div>
-          )}
-          {finalOutputs.length > 0 && (
-            <div className="border-t bg-muted/20 px-4 py-4">
-              <div className="mx-auto w-full max-w-3xl space-y-4">
-                {finalOutputs.map((entry) => (
-                  <ResultPanel key={entry.id} result={entry.result} onPreviewImage={handlePreviewImage} />
-                ))}
               </div>
             </div>
           )}
@@ -797,8 +815,8 @@ function CardLibraryOverlay({
           <h2 className="text-lg font-semibold">卡片库</h2>
           <p className="text-sm text-muted-foreground">共 {items.length} 张记忆卡片，点击卡片名称可查看详情。</p>
         </div>
-        <Button variant="ghost" onClick={onClose} className="gap-2" type="button">
-          <X className="h-4 w-4" /> 关闭
+        <Button variant="ghost" onClick={onClose} className="gap-2" type="button" aria-label="关闭">
+          <X className="h-4 w-4" />
         </Button>
       </div>
       <div className="flex flex-1 flex-col px-4 py-6">
@@ -894,9 +912,9 @@ function CardDetailModal({ result, onClose, onPreviewImage }: CardDetailModalPro
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/90 p-4">
       <div className="relative w-full max-w-4xl max-h-[90vh] overflow-y-auto rounded-3xl border bg-card p-6 shadow-2xl">
         <div className="flex items-center justify-between border-b pb-3">
-          <h3 className="text-lg font-semibold">????</h3>
-          <Button variant="ghost" onClick={onClose} className="gap-2" type="button">
-            <X className="h-4 w-4" /> ??
+          <h3 className="text-lg font-semibold">记忆卡片详情</h3>
+          <Button variant="ghost" onClick={onClose} className="gap-2" type="button" aria-label="关闭">
+            <X className="h-4 w-4" />
           </Button>
         </div>
         <div className="mt-4">
@@ -935,8 +953,9 @@ function ImagePreviewModal({ image, onClose }: ImagePreviewModalProps) {
           type="button"
           className="absolute right-4 top-4 inline-flex items-center gap-2 rounded-full bg-white/80 px-4 py-2 text-sm font-medium text-foreground shadow ring-1 ring-border"
           onClick={onClose}
+          aria-label="关闭"
         >
-          <X className="h-4 w-4" /> 关闭
+          <X className="h-4 w-4" />
         </button>
         <img src={image.src} alt={altText} className="max-h-[80vh] w-full rounded-3xl object-contain shadow-2xl" />
         {altText && <p className="mt-3 text-center text-sm text-white/80">{altText}</p>}

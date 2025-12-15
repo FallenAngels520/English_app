@@ -17,6 +17,11 @@ from .state import WordMemoryResult
 from .storage import StorageManager
 from .storage_config import load_storage_config
 
+try:  # Optional - the dashboard package may not be present in lean deployments.
+    from backend.data_dashboard.server import app as dashboard_app
+except Exception:  # pragma: no cover - best-effort import
+    dashboard_app = None
+
 app = FastAPI(title="English App Agent API", version="0.1.0")
 storage_manager = StorageManager()
 
@@ -48,6 +53,9 @@ def _mount_local_media_directory(target_app: FastAPI) -> None:
 
 
 _mount_local_media_directory(app)
+
+if dashboard_app is not None:
+    app.mount("/dashboard", dashboard_app)
 
 
 class MessagePayload(BaseModel):
