@@ -43,22 +43,167 @@ class LocalCacheStorage:
 
     def save(self, payload: Dict[str, Any]) -> None:
         timestamp = datetime.utcnow().isoformat()
-        enriched = dict(payload)
-        enriched.setdefault("cached_at", timestamp)
-        file_name = f"{payload['session_id']}-{int(time.time() * 1000)}.json"
-        enriched.setdefault("record_id", file_name)
-        target_path = self.base_dir / file_name
-        target_path.write_text(json.dumps(enriched, ensure_ascii=False), encoding="utf-8")
-        self._evict()
+        record = dict(payload)
+        record.setdefault("cached_at", timestamp)
+        record.setdefault("record_id", f"{int(time.time() * 1000)}-{uuid.uuid4().hex}.json")
 
-    def _evict(self) -> None:
-        files = sorted(self.base_dir.glob("*.json"), key=lambda item: item.stat().st_mtime)
-        while len(files) > self.max_entries:
-            oldest = files.pop(0)
-            try:
-                oldest.unlink(missing_ok=True)
-            except OSError as exc:  # pragma: no cover - best effort cleanup
-                logger.warning("Failed to delete cache file %s: %s", oldest, exc)
+        session_id = payload["session_id"]
+        records = self._read_session_records(session_id)
+        if not records:
+            legacy = self.load_legacy_records(session_id, self.max_entries)
+            if legacy:
+                records = list(reversed(legacy))
+        records.append(record)
+
+        records = self._sort_records(records)
+        if len(records) > self.max_entries:
+            records = records[:self.max_entries]
+        records = list(reversed(records))
+
+        session_payload = {
+            "session_id": session_id,
+            "updated_at": timestamp,
+            "records": records,
+        }
+        target_path = self._session_path(session_id)
+        target_path.write_text(json.dumps(session_payload, ensure_ascii=False), encoding="utf-8")
+
+    def load_records(self, session_id: str, limit: int) -> list[Dict[str, Any]]:
+        records = self._read_session_records(session_id)
+        if not records:
+            return []
+        ordered = self._sort_records(records)
+        return ordered[:limit]
+
+    def load_record(self, session_id: str, record_id: str) -> Optional[Dict[str, Any]]:
+        records = self._read_session_records(session_id)
+        for record in records:
+            if record.get("record_id") == record_id:
+                return record
+        return None
+
+    def merge_records(self, session_id: str, incoming: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        if not incoming:
+            return []
+        timestamp = datetime.utcnow().isoformat()
+        records = self._read_session_records(session_id)
+        known_ids = {record.get("record_id") for record in records if record.get("record_id")}
+        for record in incoming:
+            record.setdefault("cached_at", timestamp)
+            record_id = record.get("record_id")
+            if not record_id:
+                record_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex}.json"
+                record["record_id"] = record_id
+            if record_id in known_ids:
+                continue
+            known_ids.add(record_id)
+            records.append(record)
+
+        records = self._sort_records(records)
+        if len(records) > self.max_entries:
+            records = records[:self.max_entries]
+        records = list(reversed(records))
+        session_payload = {
+            "session_id": session_id,
+            "updated_at": timestamp,
+            "records": records,
+        }
+        self._session_path(session_id).write_text(
+            json.dumps(session_payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return records
+
+    def list_session_ids(self, max_sessions: int = 1000) -> list[str]:
+        ids: Set[str] = set()
+        for path in self.base_dir.glob("*.json"):
+            session_id = self._read_session_id(path)
+            if session_id:
+                ids.add(session_id)
+            if len(ids) >= max_sessions:
+                break
+        return sorted(ids)
+
+    def load_legacy_records(self, session_id: str, limit: int) -> list[Dict[str, Any]]:
+        pattern = f"{session_id}-*.json"
+        files = sorted(
+            [p for p in self.base_dir.glob(pattern) if p.is_file()],
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        result: list[Dict[str, Any]] = []
+        for path in files[:limit]:
+            record = self._load_record_file(path)
+            if record:
+                result.append(record)
+        return result
+
+    def _session_path(self, session_id: str) -> Path:
+        safe_session = self._sanitize_storage_key(session_id)
+        return self.base_dir / f"{safe_session}.json"
+
+    @staticmethod
+    def _sanitize_storage_key(value: str) -> str:
+        sanitized = "".join(ch for ch in value if ch.isalnum() or ch in {"-", "_"})
+        return sanitized or "session"
+
+    def _read_session_records(self, session_id: str) -> list[Dict[str, Any]]:
+        path = self._session_path(session_id)
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if isinstance(data, dict):
+            records = data.get("records")
+            return records if isinstance(records, list) else []
+        if isinstance(data, list):
+            return data
+        return []
+
+    def _read_session_id(self, path: Path) -> Optional[str]:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if isinstance(data, dict):
+            session_id = data.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                return session_id
+        if isinstance(data, dict) and "request" in data and "session_id" in data:
+            session_id = data.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                return session_id
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    session_id = item.get("session_id")
+                    if isinstance(session_id, str) and session_id:
+                        return session_id
+        return path.stem or None
+
+    def _load_record_file(self, path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if isinstance(record, dict):
+            record.setdefault("record_id", path.name)
+            return record
+        return None
+
+    @staticmethod
+    def _sort_records(records: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        indexed = list(enumerate(records))
+
+        def sort_key(item: tuple[int, Dict[str, Any]]) -> tuple[str, int]:
+            idx, record = item
+            cached_at = record.get("cached_at")
+            return (cached_at if isinstance(cached_at, str) else "", idx)
+
+        ordered = sorted(indexed, key=sort_key, reverse=True)
+        return [record for _, record in ordered]
 
 
 class DatabaseStorage:
@@ -367,7 +512,7 @@ class StorageManager:
                 self._download_archive_records,
                 archive_store,
                 archive_cfg,
-                storage_config.local_cache,
+                self._get_local_cache(storage_config.local_cache),
                 session_id,
                 limit,
             )
@@ -381,28 +526,17 @@ class StorageManager:
         cache_config: LocalCacheConfig,
         limit: int,
     ) -> list[Dict[str, Any]]:
-        base_dir = Path(cache_config.directory).expanduser()
-        if not base_dir.exists():
-            return []
-
-        pattern = f"{session_id}-*.json"
-        files = sorted(
-            [p for p in base_dir.glob(pattern) if p.is_file()],
-            key=lambda item: item.stat().st_mtime,
-            reverse=True,
-        )
-        result: list[Dict[str, Any]] = []
-        for path in files[:limit]:
-            record = self._load_record_file(path)
-            if record:
-                result.append(record)
-        return result
+        local_cache = self._get_local_cache(cache_config)
+        records = local_cache.load_records(session_id, limit)
+        if records:
+            return records
+        return local_cache.load_legacy_records(session_id, limit)
 
     def _download_archive_records(
         self,
         store: AliyunOSSStorage,
         archive_config: CacheArchiveConfig,
-        cache_config: LocalCacheConfig,
+        local_cache: LocalCacheStorage,
         session_id: str,
         limit: int,
     ) -> list[Dict[str, Any]]:
@@ -410,9 +544,6 @@ class StorageManager:
         keys = store.list_object_keys(prefix, max_keys=limit)
         if not keys:
             return []
-
-        base_dir = Path(cache_config.directory).expanduser()
-        base_dir.mkdir(parents=True, exist_ok=True)
 
         results: list[Dict[str, Any]] = []
         for key in keys:
@@ -425,26 +556,16 @@ class StorageManager:
                 continue
             file_name = key.split("/")[-1]
             record.setdefault("record_id", file_name)
-            try:
-                (base_dir / file_name).write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
-            except OSError:
-                pass
             results.append(record)
+        if results:
+            local_cache.merge_records(session_id, results)
         return results
-
-    def _load_record_file(self, path: Path) -> Optional[Dict[str, Any]]:
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        record.setdefault("record_id", path.name)
-        return record
 
     def _download_single_archive_record(
         self,
         store: AliyunOSSStorage,
         archive_config: CacheArchiveConfig,
-        cache_config: LocalCacheConfig,
+        local_cache: LocalCacheStorage,
         session_id: str,
         record_id: str,
     ) -> Optional[Dict[str, Any]]:
@@ -457,24 +578,15 @@ class StorageManager:
         except json.JSONDecodeError:
             return None
         record.setdefault("record_id", record_id)
-        base_dir = Path(cache_config.directory).expanduser()
-        base_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            (base_dir / record_id).write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
-        except OSError:
-            pass
+        local_cache.merge_records(session_id, [record])
         return record
 
     def list_session_ids(self, storage_config: StorageConfig, max_sessions: int = 1000) -> List[str]:
         ids: Set[str] = set()
-        base_dir = Path(storage_config.local_cache.directory).expanduser()
-        if base_dir.exists():
-            for path in base_dir.glob("*.json"):
-                prefix = path.name.split("-")[0]
-                if prefix:
-                    ids.add(prefix)
-                if len(ids) >= max_sessions:
-                    break
+        local_cache = self._get_local_cache(storage_config.local_cache)
+        ids.update(local_cache.list_session_ids(max_sessions=max_sessions))
+        if len(ids) >= max_sessions:
+            return sorted(ids)
 
         archive_cfg = storage_config.archive
         if archive_cfg.enable and archive_cfg.provider == "aliyun_oss":
@@ -501,12 +613,10 @@ class StorageManager:
         record_id: str,
         storage_config: StorageConfig,
     ) -> Optional[Dict[str, Any]]:
-        base_dir = Path(storage_config.local_cache.directory).expanduser()
-        path = base_dir / record_id
-        if path.exists():
-            record = self._load_record_file(path)
-            if record:
-                return record
+        local_cache = self._get_local_cache(storage_config.local_cache)
+        record = local_cache.load_record(session_id, record_id)
+        if record:
+            return record
 
         archive_cfg = storage_config.archive
         if archive_cfg.enable and archive_cfg.provider == "aliyun_oss":
@@ -515,7 +625,7 @@ class StorageManager:
                 self._download_single_archive_record,
                 archive_store,
                 archive_cfg,
-                storage_config.local_cache,
+                local_cache,
                 session_id,
                 record_id,
             )
