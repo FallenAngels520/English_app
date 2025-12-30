@@ -43,6 +43,16 @@ uv run uvicorn english_app_agent.server:app --app-dir src --reload --port 8000
 - `--reload` is optional but useful while iterating on prompts or graph logic.
 - Set `AGENT_API_BASE_URL=http://127.0.0.1:8000` in the frontend env so `/api/chat` proxies requests to this service.
 
+
+### Skills Integration
+
+The mnemonic agent injects skills at runtime using `src/english_app_agent/skills_provider.py`:
+
+- Skills live under `skills/<skill-name>/SKILL.md` with optional `references/` files.
+- `SkillManager` discovers skills, selects with a keyword/BM25 selector, and injects the selected skill body into the mnemonic prompt.
+- References like `references/phoneme-mapping.md` are appended when present.
+- Skills refresh on a 60s TTL, so you can update files without restarting the server.
+
 ### Storage & Persistence
 
 Every successful `/chat` response flows through a tiered storage manager:
