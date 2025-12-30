@@ -135,8 +135,20 @@ class LocalCacheStorage:
         for path in files[:limit]:
             record = self._load_record_file(path)
             if record:
-                result.append(record)
+                normalized = self._normalize_record(record)
+                if normalized:
+                    result.append(normalized)
         return result
+
+    def load_legacy_record_by_id(self, record_id: str) -> Optional[Dict[str, Any]]:
+        path = self.base_dir / record_id
+        if not path.exists():
+            return None
+        record = self._load_record_file(path)
+        if not record:
+            return None
+        normalized = self._normalize_record(record)
+        return normalized or None
 
     def _session_path(self, session_id: str) -> Path:
         safe_session = self._sanitize_storage_key(session_id)
@@ -157,9 +169,23 @@ class LocalCacheStorage:
             return []
         if isinstance(data, dict):
             records = data.get("records")
-            return records if isinstance(records, list) else []
+            if not isinstance(records, list):
+                return []
+            normalized: list[Dict[str, Any]] = []
+            for item in records:
+                if isinstance(item, dict):
+                    record = self._normalize_record(item)
+                    if record:
+                        normalized.append(record)
+            return normalized
         if isinstance(data, list):
-            return data
+            normalized: list[Dict[str, Any]] = []
+            for item in data:
+                if isinstance(item, dict):
+                    record = self._normalize_record(item)
+                    if record:
+                        normalized.append(record)
+            return normalized
         return []
 
     def _read_session_id(self, path: Path) -> Optional[str]:
@@ -192,6 +218,29 @@ class LocalCacheStorage:
             record.setdefault("record_id", path.name)
             return record
         return None
+
+    @staticmethod
+    def _parse_json_if_needed(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value
+        return value
+
+    def _normalize_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        response = record.get("response")
+        response = self._parse_json_if_needed(response)
+        if isinstance(response, dict):
+            final_output = response.get("final_output")
+            final_output = self._parse_json_if_needed(final_output)
+            response["final_output"] = final_output
+            record["response"] = response
+        request = record.get("request")
+        request = self._parse_json_if_needed(request)
+        if isinstance(request, dict):
+            record["request"] = request
+        return record
 
     @staticmethod
     def _sort_records(records: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
@@ -419,6 +468,7 @@ class StorageManager:
             new_url = self._download_media_to_local(media.audio.url, target_dir, "audio", safe_session)
             if new_url:
                 media.audio.url = new_url
+        self._cleanup_local_media(target_dir, media_config)
 
         return updated
 
@@ -466,6 +516,43 @@ class StorageManager:
             logger.warning("Failed to save media locally (%s): %s", dest_path, exc)
             return None
         return f"/media/{session_folder}/{file_name}"
+
+    def _cleanup_local_media(self, target_dir: Path, media_config: MediaStorageConfig) -> None:
+        max_files = media_config.cleanup_max_files
+        max_bytes = media_config.cleanup_max_bytes
+        if not max_files and not max_bytes:
+            return
+        if not target_dir.exists():
+            return
+        files: list[tuple[Path, float, int]] = []
+        for path in target_dir.glob("*"):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            files.append((path, stat.st_mtime, stat.st_size))
+        if not files:
+            return
+        files.sort(key=lambda item: item[1])
+        total_bytes = sum(item[2] for item in files)
+
+        def over_limit() -> bool:
+            if max_files and len(files) > max_files:
+                return True
+            if max_bytes and total_bytes > max_bytes:
+                return True
+            return False
+
+        while files and over_limit():
+            path, _, size = files.pop(0)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:  # pragma: no cover - best effort cleanup
+                logger.warning("Failed to delete media file %s: %s", path, exc)
+                break
+            total_bytes = max(0, total_bytes - size)
 
     @staticmethod
     def sanitize_storage_key(value: str) -> str:
@@ -617,6 +704,9 @@ class StorageManager:
         record = local_cache.load_record(session_id, record_id)
         if record:
             return record
+        legacy_record = local_cache.load_legacy_record_by_id(record_id)
+        if legacy_record:
+            return legacy_record
 
         archive_cfg = storage_config.archive
         if archive_cfg.enable and archive_cfg.provider == "aliyun_oss":

@@ -32,6 +32,8 @@ class MediaStorageConfig(BaseModel):
     access_key_secret: Optional[str] = None
     prefix: str = "chat_media/"
     local_directory: str = os.path.expanduser("~/.english_app_agent/media")
+    cleanup_max_files: Optional[int] = None
+    cleanup_max_bytes: Optional[int] = None
 
 
 class CacheArchiveConfig(BaseModel):
@@ -87,6 +89,16 @@ def load_storage_config(config: Optional[RunnableConfig]) -> StorageConfig:
     )
 
     media_cfg = configurable.get("storage", {}).get("media", {})
+    cleanup_files_default = media_cfg.get("cleanup_max_files", cfg.media.cleanup_max_files)
+    cleanup_files_default = cleanup_files_default if isinstance(cleanup_files_default, int) else -1
+    cleanup_bytes_default = media_cfg.get("cleanup_max_bytes", cfg.media.cleanup_max_bytes)
+    cleanup_bytes_default = cleanup_bytes_default if isinstance(cleanup_bytes_default, int) else -1
+    cleanup_max_files = _env_int("MEDIA_CLEANUP_MAX_FILES", cleanup_files_default)
+    if cleanup_max_files <= 0:
+        cleanup_max_files = None
+    cleanup_max_bytes = _env_int("MEDIA_CLEANUP_MAX_BYTES", cleanup_bytes_default)
+    if cleanup_max_bytes <= 0:
+        cleanup_max_bytes = None
     cfg.media = MediaStorageConfig(
         enable=_env_bool("MEDIA_ENABLE", media_cfg.get("enable", cfg.media.enable)),
         provider=media_cfg.get("provider", cfg.media.provider),
@@ -101,6 +113,8 @@ def load_storage_config(config: Optional[RunnableConfig]) -> StorageConfig:
             "MEDIA_LOCAL_DIRECTORY",
             media_cfg.get("local_directory", cfg.media.local_directory),
         ),
+        cleanup_max_files=cleanup_max_files,
+        cleanup_max_bytes=cleanup_max_bytes,
     )
 
     archive_cfg = configurable.get("storage", {}).get("archive", {})
